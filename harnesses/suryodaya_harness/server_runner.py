@@ -302,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
 
     import argparse
 
-    parser = argparse.ArgumentParser(prog="python -m harness.server_runner")
+    parser = argparse.ArgumentParser(prog="python -m harnesses.suryodaya_harness.server_runner")
     parser.add_argument("--results", type=Path, default=Path("results.json"))
     args = parser.parse_args(argv)
     try:

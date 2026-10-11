@@ -18,7 +18,7 @@ from calendar_agent import (
 )
 from calendar_agent.models import MutationDisabledError
 from calendar_agent.tools import ReadOnlyCalendarTool
-from harness.assertions import verify_result, verify_supported_slot
+from harnesses.suryodaya_harness.assertions import verify_result, verify_supported_slot
 from tests.unit.fakes import FakeCalendarTools
 
 

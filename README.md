@@ -50,32 +50,32 @@ Goal 1 never creates or books the candidate event, and Goal 2 never updates even
 
 ## Harness demonstration
 
-The Harness is part of this same repository as the Calendar Agent. It is an independent, deterministic verification layer around the real `CalendarAgent` and `BoundedAgentRuntime`; it does not duplicate goal-handler logic.
+The Suryodaya Harness lives in `harnesses/suryodaya_harness/` alongside the separate Keystone Harness in `harnesses/keystone_harness/`. The Suryodaya Harness is an independent, deterministic verification layer around the real `CalendarAgent` and `BoundedAgentRuntime`; it does not duplicate goal-handler logic.
 
 Run the local demo:
 
 ```powershell
-python -m harness
+python -m harnesses.suryodaya_harness
 ```
 
 The demo uses deterministic in-memory Calendar tools and a fixed model decision, then runs the Agent through the Harness, verifies the structured result, writes `.harness-artifacts/demo.json`, reloads that RawRun artifact, and evaluates it. The artifact directory is ignored by Git. No provider, live MCP call, credentials, or mutation is required.
 
 ### Phase 1 local scheduling surface
 
-The independent Harness also includes deterministic fixtures for the newer scheduling surface in `harness.phase1`. These model paginated Party identity data, attendee roles and responses, timezone-aware and malformed free/busy intervals, scheduling-link duration mismatches, audit buffers and strict event boundaries, booking/event consistency, subscription freshness, workflow side effects, risk-based tool policy, execution evidence, and provider or authority failures.
+The independent Suryodaya Harness also includes deterministic fixtures for the newer scheduling surface in `harnesses.suryodaya_harness.phase1`. These model paginated Party identity data, attendee roles and responses, timezone-aware and malformed free/busy intervals, scheduling-link duration mismatches, audit buffers and strict event boundaries, booking/event consistency, subscription freshness, workflow side effects, risk-based tool policy, execution evidence, and provider or authority failures.
 
 These fixtures are local test data only. Planning remains distinct from execution and proposals remain distinct from committed mutations. The Harness does not call the live Suryodaya deployment, Keystone, a provider, or an external communication/mutation endpoint; provider HTTP 401 evidence is kept distinct from agent or tool permission failures. Live LLM integration, mutation execution, and authoritative subscription or evaluator data remain intentionally unsupported.
 
 Replay and rescore an existing artifact without rerunning the Agent:
 
 ```powershell
-python -m harness replay .harness-artifacts/demo.json
+python -m harnesses.suryodaya_harness replay .harness-artifacts/demo.json
 ```
 
 Replay loads the persisted artifact and invokes only the deterministic scorer. It does not invoke the model, `CalendarAgent`, Calendar tools, MCP, or mutations. With no externally supplied predicate, the result is `UNEVALUATED`, which is not approval. An explicit predicate can be supplied when independently available:
 
 ```powershell
-python -m harness replay .harness-artifacts/demo.json --predicate passed
+python -m harnesses.suryodaya_harness replay .harness-artifacts/demo.json --predicate passed
 ```
 
 Current evaluation is deterministic and predicate-state driven. The demo supplies its independent Harness verification as the predicate; replay does not infer evaluation from model decisions, prose, or `claimed_outcome`.

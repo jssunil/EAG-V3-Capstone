@@ -14,8 +14,8 @@ from calendar_agent.models import (
     ToolCallRecord,
 )
 from calendar_agent.runtime import BoundedAgentRuntime
-from harness.assertions import verify_result
-from harness.runner import Harness
+from harnesses.suryodaya_harness.assertions import verify_result
+from harnesses.suryodaya_harness.runner import Harness
 
 from tests.unit.fakes import FakeCalendarTools
 

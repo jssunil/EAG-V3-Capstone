@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from calendar_agent.agent import CalendarAgent
 from calendar_agent.models import AgentTask, PartyPage, PartyRecord, ResultStatus, ToolCallRecord
-from harness.assertions import verify_result, verify_supported_slot
+from harnesses.suryodaya_harness.assertions import verify_result, verify_supported_slot
 
 from .fakes import FakeCalendarTools
 

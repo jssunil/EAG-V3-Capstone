@@ -27,7 +27,7 @@ from calendar_agent import (
     load_raw_run,
     persist_raw_run,
 )
-from harness.assertions import verify_result
+from harnesses.suryodaya_harness.assertions import verify_result
 from tests.unit.fakes import FakeCalendarTools
 
 

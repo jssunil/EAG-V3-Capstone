@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.results import (
+from harnesses.suryodaya_harness.results import (
     GoalOutcome,
     OutcomeStatus,
     PredicateEvaluation,
@@ -70,7 +70,7 @@ def test_official_configuration_contains_verified_field_names_without_inventing_
     config = (ROOT / "agentswitch-harness.toml").read_text(encoding="utf-8")
 
     assert 'install = "pip install -e ."' in config
-    assert 'run = "python -m harness.runner"' in config
+    assert 'run = "python -m harnesses.suryodaya_harness.runner"' in config
     assert 'results = "results.json"' in config
     assert "instances = []" in config
     assert "timeout_minutes = 10" in config

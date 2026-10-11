@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 
-_SRC_ROOT = Path(__file__).resolve().parent.parent / "src"
+_SRC_ROOT = Path(__file__).resolve().parents[2] / "src"
 if _SRC_ROOT.is_dir() and str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
@@ -79,7 +79,7 @@ def _predicate_state(value: str) -> EvaluationState | None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m harness")
+    parser = argparse.ArgumentParser(prog="python -m harnesses.suryodaya_harness")
     parser.add_argument("--artifact", type=Path, default=DEFAULT_ARTIFACT)
     subparsers = parser.add_subparsers(dest="command")
     replay = subparsers.add_parser("replay", help="load and rescore an existing artifact")

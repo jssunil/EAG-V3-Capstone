@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 from typing import TYPE_CHECKING
 
-_SRC_ROOT = Path(__file__).resolve().parent.parent / "src"
+_SRC_ROOT = Path(__file__).resolve().parents[2] / "src"
 if _SRC_ROOT.is_dir() and str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 

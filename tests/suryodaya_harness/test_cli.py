@@ -6,9 +6,9 @@ from calendar_agent import CalendarAgent, DeterministicScorer, Verdict
 from calendar_agent.evaluation import EvaluationState
 from calendar_agent.persistence import load_raw_run, persist_raw_run
 from calendar_agent.runtime import BoundedAgentRuntime
-from harness.__main__ import main, replay_artifact, run_demo
-from harness.fixtures import deterministic_scenario
-from harness.runner import Harness
+from harnesses.suryodaya_harness.__main__ import main, replay_artifact, run_demo
+from harnesses.suryodaya_harness.fixtures import deterministic_scenario
+from harnesses.suryodaya_harness.runner import Harness
 
 
 class CountingCalendarAgent(CalendarAgent):
@@ -126,8 +126,8 @@ def test_replay_does_not_construct_runtime_or_provider_components(tmp_path, monk
 
     monkeypatch.setattr("calendar_agent.agent.CalendarAgent", forbidden)
     monkeypatch.setattr("calendar_agent.agentswitch_client.AgentSwitchClient", forbidden)
-    monkeypatch.setattr("harness.fixtures.DeterministicCalendarTools", forbidden)
-    monkeypatch.setattr("harness.fixtures.FixedGoalModel", forbidden)
+    monkeypatch.setattr("harnesses.suryodaya_harness.fixtures.DeterministicCalendarTools", forbidden)
+    monkeypatch.setattr("harnesses.suryodaya_harness.fixtures.FixedGoalModel", forbidden)
 
     evaluation = replay_artifact(
         artifact,

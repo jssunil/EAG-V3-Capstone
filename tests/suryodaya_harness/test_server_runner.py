@@ -7,10 +7,10 @@ import sys
 
 import pytest
 
-from harness.__main__ import main as local_harness_main
-from harness.results import OutcomeStatus, PredicateEvaluation, parse_results
-from harness.runner import Harness, main as runner_main
-from harness.server_runner import (
+from harnesses.suryodaya_harness.__main__ import main as local_harness_main
+from harnesses.suryodaya_harness.results import OutcomeStatus, PredicateEvaluation, parse_results
+from harnesses.suryodaya_harness.runner import Harness, main as runner_main
+from harnesses.suryodaya_harness.server_runner import (
     GOAL_TITLES,
     EvaluatorContractError,
     ServerConfigurationError,
@@ -159,7 +159,7 @@ def _subprocess_environment(**updates: str) -> dict[str, str]:
 
 def test_module_import_does_not_execute_or_create_results(tmp_path: Path) -> None:
     result = subprocess.run(
-        [sys.executable, "-c", "import harness.runner"],
+        [sys.executable, "-c", "import harnesses.suryodaya_harness.runner"],
         cwd=tmp_path,
         env=_subprocess_environment(),
         capture_output=True,
@@ -177,7 +177,7 @@ def test_configured_module_entry_point_writes_unevaluated_results(tmp_path: Path
     output = tmp_path / "results.json"
 
     result = subprocess.run(
-        [sys.executable, "-m", "harness.runner", "--results", str(output)],
+        [sys.executable, "-m", "harnesses.suryodaya_harness.runner", "--results", str(output)],
         cwd=tmp_path,
         env=_subprocess_environment(),
         capture_output=True,
@@ -200,7 +200,7 @@ def test_invalid_configuration_writes_nonpassing_results_and_returns_failure(tmp
     environment.pop("AGENTSWITCH_INSTANCE")
 
     result = subprocess.run(
-        [sys.executable, "-m", "harness.runner", "--results", str(output)],
+        [sys.executable, "-m", "harnesses.suryodaya_harness.runner", "--results", str(output)],
         cwd=tmp_path,
         env=environment,
         capture_output=True,
@@ -217,7 +217,7 @@ def test_local_demo_entry_point_remains_unchanged(tmp_path: Path) -> None:
     artifact = tmp_path / "demo.json"
 
     result = subprocess.run(
-        [sys.executable, "-m", "harness", "--artifact", str(artifact)],
+        [sys.executable, "-m", "harnesses.suryodaya_harness", "--artifact", str(artifact)],
         cwd=tmp_path,
         env=_subprocess_environment(),
         capture_output=True,
@@ -318,7 +318,7 @@ def test_atomic_write_failure_preserves_target_and_cleans_temporary_file(
     def fail_replace(source: Path, target: Path) -> None:
         raise OSError("contains a secret token")
 
-    monkeypatch.setattr("harness.server_runner.os.replace", fail_replace)
+    monkeypatch.setattr("harnesses.suryodaya_harness.server_runner.os.replace", fail_replace)
     output = tmp_path / "results.json"
     original = b'{"existing result": true}\n'
     output.write_bytes(original)
@@ -365,7 +365,7 @@ def test_atomic_write_temporary_file_creation_failure_preserves_files(
     def fail_temporary_file(*args: object, **kwargs: object) -> None:
         raise OSError("contains a secret token")
 
-    monkeypatch.setattr("harness.server_runner.tempfile.NamedTemporaryFile", fail_temporary_file)
+    monkeypatch.setattr("harnesses.suryodaya_harness.server_runner.tempfile.NamedTemporaryFile", fail_temporary_file)
     with pytest.raises(ServerRunnerError, match="could not write results safely") as error:
         write_results_atomic(output, "safe")
 
@@ -385,7 +385,7 @@ def test_cli_returns_failure_when_atomic_result_write_fails(
     def fail_replace(source: Path, target: Path) -> None:
         raise OSError("replace failed")
 
-    monkeypatch.setattr("harness.server_runner.os.replace", fail_replace)
+    monkeypatch.setattr("harnesses.suryodaya_harness.server_runner.os.replace", fail_replace)
     output = tmp_path / "results.json"
     original = b"previous run result"
     output.write_bytes(original)

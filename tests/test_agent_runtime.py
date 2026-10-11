@@ -16,8 +16,8 @@ from calendar_agent import (
     TerminationReason,
 )
 from calendar_agent.models import AgentResult, AgentTask, MutationDisabledError, ToolCallRecord
-from harness.assertions import verify_result
-from harness.runner import Harness
+from harnesses.suryodaya_harness.assertions import verify_result
+from harnesses.suryodaya_harness.runner import Harness
 from calendar_agent.tools import ReadOnlyCalendarTool
 from tests.unit.fakes import FakeCalendarTools
 

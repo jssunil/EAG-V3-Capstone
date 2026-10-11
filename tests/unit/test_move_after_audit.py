@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from calendar_agent.agent import CalendarAgent
 from calendar_agent.models import AgentTask, ResultStatus
-from harness.assertions import verify_rescheduling_plan, verify_result
+from harnesses.suryodaya_harness.assertions import verify_rescheduling_plan, verify_result
 
 from .fakes import FakeCalendarTools
 

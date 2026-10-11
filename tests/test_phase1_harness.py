@@ -15,8 +15,8 @@ from calendar_agent import (
     ToolCallRecord,
 )
 from calendar_agent.tools import ReadOnlyCalendarTool
-from harness.assertions import verify_rescheduling_plan
-from harness.fixtures import (
+from harnesses.suryodaya_harness.assertions import verify_rescheduling_plan
+from harnesses.suryodaya_harness.fixtures import (
     attendee_consistency_errors,
     assert_planning_side_effect_free,
     audit_fixture_events,
@@ -37,7 +37,7 @@ from harness.fixtures import (
     subscription_fixtures,
     workflow_actions,
 )
-from harness.phase1 import (
+from harnesses.suryodaya_harness.phase1 import (
     HostPoolBoundary,
     MeetingBooking,
     normalize_free_busy,
@@ -163,7 +163,7 @@ def test_declined_required_attendee_blocks_but_optional_does_not() -> None:
     declined_required = EventAttendee("event-1", "party-1", "one@example.test", "required", "declined")
     declined_optional = EventAttendee("event-1", "party-2", "two@example.test", "optional", "declined")
 
-    from harness.phase1 import required_attendee_feasible
+    from harnesses.suryodaya_harness.phase1 import required_attendee_feasible
 
     assert required_attendee_feasible([declined_optional])
     assert not required_attendee_feasible([declined_required])
@@ -422,7 +422,7 @@ def test_provider_401_is_not_an_agent_resource_authority_failure() -> None:
     assert failure.mutations == 0
     assert failure.token_usage is None
     assert failure.cost is None
-    assert all(item.kind is not AuthorityFailureKind.AGENT_UNAUTHORIZED for item in __import__("harness.phase1", fromlist=["authority_failure_fixtures"]).authority_failure_fixtures() if item.provider_status == 401)
+    assert all(item.kind is not AuthorityFailureKind.AGENT_UNAUTHORIZED for item in __import__("harnesses.suryodaya_harness.phase1", fromlist=["authority_failure_fixtures"]).authority_failure_fixtures() if item.provider_status == 401)
 
 
 def test_subscription_status_errors_prevent_stale_or_failed_data_from_being_authoritative() -> None:
