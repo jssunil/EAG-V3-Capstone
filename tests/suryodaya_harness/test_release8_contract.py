@@ -66,14 +66,14 @@ def valid_document() -> dict[str, object]:
     }
 
 
-def test_official_configuration_contains_verified_field_names_without_inventing_instance() -> None:
+def test_hosted_configuration_targets_both_supported_instances() -> None:
     config = (ROOT / "agentswitch-harness.toml").read_text(encoding="utf-8")
 
     assert 'install = "pip install -e ."' in config
-    assert 'run = "python -m harnesses.suryodaya_harness.runner"' in config
+    assert 'run = "python -m harnesses.suryodaya_harness.hosted_runner"' in config
     assert 'results = "results.json"' in config
-    assert "instances = []" in config
-    assert "timeout_minutes = 10" in config
+    assert 'instances = ["suryodaya", "keystone"]' in config
+    assert "timeout_minutes = 20" in config
 
 
 def test_valid_results_round_trip() -> None:

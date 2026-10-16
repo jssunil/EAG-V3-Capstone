@@ -1,7 +1,6 @@
 install = "pip install -e ."
-run = "python -m harnesses.suryodaya_harness.runner"
+run = "python -m harnesses.suryodaya_harness.hosted_runner"
 results = "results.json"
 
-# Seat 19's AgentSwitch instance is not verified yet. Fill this before submission.
-instances = []
-timeout_minutes = 10
+instances = ["suryodaya", "keystone"]
+timeout_minutes = 20

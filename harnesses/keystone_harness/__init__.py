@@ -1,6 +1,7 @@
 """Isolated, offline-first foundation for the Keystone Harness."""
 
 from .client import (
+    DiscoveredTool,
     KeystoneAuthenticationError,
     KeystoneClient,
     KeystoneClientError,
@@ -43,6 +44,7 @@ from .discovery import (
 
 __all__ = [
     "DEFAULT_BASE_URL",
+    "DiscoveredTool",
     "KeystoneAuthenticationError",
     "KeystoneClient",
     "KeystoneClientError",

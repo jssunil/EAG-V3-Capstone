@@ -37,6 +37,10 @@ class FakeResponse:
             raise self.payload
         return self.payload
 
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.HTTPError(response=self)
+
 
 class FakeSession:
     def __init__(self, response: FakeResponse | Exception | None = None) -> None:
@@ -173,6 +177,79 @@ def test_response_parser_accepts_a_valid_json_rpc_result() -> None:
         {"jsonrpc": "2.0", "id": 7, "result": {"read_only": True}},
         7,
     ) == {"read_only": True}
+
+
+def test_list_tools_performs_only_protocol_discovery() -> None:
+    session = FakeSession(response({
+        "tools": [
+            {"name": "Party.list", "annotations": {"readOnlyHint": True}, "inputSchema": {}},
+            {"name": "Party.create", "annotations": {"readOnlyHint": False}, "inputSchema": {}},
+        ],
+    }))
+    client = KeystoneClient(KeystoneConfig(token=SECRET), session=session)  # type: ignore[arg-type]
+
+    tools = client.list_tools()
+
+    assert [(tool.name, tool.read_only_hint) for tool in tools] == [
+        ("Party.list", True),
+        ("Party.create", False),
+    ]
+    assert len(session.calls) == 1
+    request = session.calls[0]
+    assert request["url"] == f"{DEFAULT_BASE_URL}/api/mcp"
+    assert request["headers"]["Authorization"] == f"Bearer {SECRET}"
+    assert request["json"] == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {},
+    }
+
+
+def test_list_tools_requires_token_without_transport() -> None:
+    session = FakeSession()
+    client = KeystoneClient(KeystoneConfig(), session=session)  # type: ignore[arg-type]
+
+    with pytest.raises(KeystoneAuthenticationError):
+        client.list_tools()
+
+    assert session.calls == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        {"jsonrpc": "2.0", "id": 1, "result": {"tools": "Party.list"}},
+        {"jsonrpc": "2.0", "id": 1, "result": {"tools": [None]}},
+        {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "", "annotations": {}}]}},
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "Party.list", "annotations": {"readOnlyHint": "yes"}}]},
+        },
+    ],
+)
+def test_list_tools_rejects_malformed_catalog(payload: object) -> None:
+    client = KeystoneClient(
+        KeystoneConfig(token=SECRET),
+        session=FakeSession(FakeResponse(payload)),
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(KeystoneProtocolError):
+        client.list_tools()
+
+
+def test_list_tools_rejects_http_error_without_body() -> None:
+    client = KeystoneClient(
+        KeystoneConfig(token=SECRET),
+        session=FakeSession(FakeResponse({"sensitive": SECRET}, status_code=403)),
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(KeystoneHttpError) as caught:
+        client.list_tools()
+
+    assert SECRET not in str(caught.value)
 
 
 def test_production_transport_allowlist_stays_empty() -> None:

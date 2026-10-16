@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import requests
 
-from .config import KeystoneConfig
+from .config import KeystoneConfig, KeystoneConfigurationError
 
 
 class KeystoneClientError(RuntimeError):
@@ -50,15 +51,23 @@ class KeystoneToolError(KeystoneClientError):
     """Raised when an MCP result reports an operation error."""
 
 
+@dataclass(frozen=True)
+class DiscoveredTool:
+    """Minimal, non-executable metadata returned by MCP tool discovery."""
+
+    name: str
+    read_only_hint: bool | None
+
+
 # Diagnostic declaration only. call_read has no transport execution path.
 PRODUCTION_READ_ONLY_OPERATIONS: tuple[str, ...] = ()
 
 
 class KeystoneClient:
-    """Offline-only Keystone client shell; no operation is enabled for transport.
+    """Keystone client limited to protocol discovery; business tools stay disabled.
 
-    Construction stores configuration/session objects only. A trusted operation
-    policy and Keystone protocol contract must exist before transport is added.
+    ``tools/list`` discovers metadata but cannot invoke a business operation.
+    ``call_read`` remains disabled until trusted operation approval exists.
     """
 
     def __init__(
@@ -70,6 +79,77 @@ class KeystoneClient:
             raise TypeError("config must be a KeystoneConfig")
         self.config = config
         self._session = session if session is not None else requests.Session()
+
+    def list_tools(self) -> tuple[DiscoveredTool, ...]:
+        """Fetch only the MCP tool catalog; never invoke a listed tool."""
+
+        try:
+            token = self.config.require_token()
+        except KeystoneConfigurationError:
+            raise KeystoneAuthenticationError(
+                "Set KEYSTONE_TOKEN to discover Keystone MCP tools."
+            ) from None
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {},
+        }
+        try:
+            response = self._session.post(
+                self.config.endpoint,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+                json=payload,
+                timeout=self.config.timeout,
+            )
+        except requests.Timeout as exc:
+            raise KeystoneTimeoutError("Keystone tool discovery timed out.") from exc
+        except requests.RequestException as exc:
+            raise KeystoneTransportError("Keystone tool discovery failed.") from exc
+
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            if response.status_code == 401:
+                raise KeystoneAuthenticationError(
+                    "Keystone rejected the authenticated tool-discovery request."
+                ) from exc
+            raise KeystoneHttpError(
+                f"Keystone returned HTTP {response.status_code} for tool discovery."
+            ) from exc
+
+        try:
+            message = response.json()
+        except ValueError as exc:
+            raise KeystoneJsonError("Keystone returned invalid JSON.") from exc
+
+        result = self._parse_response(message, 1)
+        tools = result.get("tools")
+        if not isinstance(tools, list):
+            raise KeystoneProtocolError("Keystone tools/list result has no tools array.")
+
+        discovered: list[DiscoveredTool] = []
+        for item in tools:
+            if not isinstance(item, dict):
+                raise KeystoneProtocolError("Keystone tools/list contains an invalid tool.")
+            name = item.get("name")
+            annotations = item.get("annotations", {})
+            if (
+                not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(annotations, dict)
+            ):
+                raise KeystoneProtocolError("Keystone tools/list contains malformed tool metadata.")
+            read_only_hint = annotations.get("readOnlyHint")
+            if read_only_hint is not None and type(read_only_hint) is not bool:
+                raise KeystoneProtocolError("Keystone tool read-only metadata is malformed.")
+            discovered.append(DiscoveredTool(name=name.strip(), read_only_hint=read_only_hint))
+        return tuple(discovered)
 
     def call_read(
         self,
