@@ -68,7 +68,7 @@ These fixtures are local test data only. Planning remains distinct from executio
 
 ### Hosted AgentSwitch harness
 
-`agentswitch-harness.toml` configures the AgentSwitch server runner. It invokes `harnesses.suryodaya_harness.hosted_runner` once for each of Suryodaya and Keystone. The runner uses only the server-provided `AGENTSWITCH_*` instance settings, validates that the base URL is HTTPS and credential-free, and does not read local credentials or `.env` files.
+`agentswitch-harness.toml` configures the AgentSwitch server runner. It invokes `harnesses.suryodaya_harness.hosted_runner` once for each of Suryodaya and Keystone. The runner uses only the server-provided `AGENTSWITCH_*` instance settings, validates that the base URL is absolute HTTP(S) without embedded credentials, a query, or a fragment, and does not read local credentials or `.env` files.
 
 - Suryodaya runs `calendar.find_30_minutes` through the deterministic Calendar Agent and the read-only tool boundary, using a rolling 14-day search window. Its harness check passes only when the planner returns one independently validated 30-minute candidate; unresolved identity, unavailable data, or an invalid candidate is reported as unevaluated/non-passing with sanitized evidence.
 - Keystone performs only the MCP `tools/list` protocol request. It does not invoke any listed business operation. A non-empty, valid tool catalog passes this discovery check; this is not a Calendar goal result.

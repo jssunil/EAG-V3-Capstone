@@ -130,17 +130,17 @@ def test_hosted_environment_uses_platform_injected_secure_instance_url() -> None
     assert config.base_url == "https://runner.example.test/tenant/suryodaya"
 
 
-def test_hosted_environment_rejects_insecure_instance_url() -> None:
+def test_hosted_environment_rejects_unsupported_url_scheme() -> None:
     try:
         load_hosted_environment({
             "AGENTSWITCH_INSTANCE": "keystone",
-            "AGENTSWITCH_BASE_URL": "http://runner.example.test/tenant/keystone",
+            "AGENTSWITCH_BASE_URL": "ftp://runner.example.test/tenant/keystone",
             "AGENTSWITCH_TOKEN": "secret-token",
         })
     except HostedConfigurationError as exc:
-        assert "HTTPS" in str(exc)
+        assert "HTTP(S)" in str(exc)
     else:
-        raise AssertionError("The runner must not send its token over HTTP.")
+        raise AssertionError("The runner must reject unsupported URL schemes.")
 
 
 def test_tool_trace_summary_does_not_include_party_data() -> None:

@@ -80,15 +80,33 @@ def test_hosted_runner_config_accepts_secure_platform_endpoint() -> None:
 @pytest.mark.parametrize(
     "base_url",
     [
-        "http://runner.example.test",
+        "ftp://runner.example.test",
         "https://user:password@runner.example.test",
         "https://runner.example.test?instance=keystone",
-        "https://runner.example.test:444",
+        "https://runner.example.test:99999",
     ],
 )
 def test_hosted_runner_config_rejects_unsafe_endpoint(base_url: str) -> None:
     with pytest.raises(KeystoneConfigurationError):
         KeystoneConfig.for_hosted_runner(base_url=base_url, token=SECRET)
+
+
+def test_hosted_runner_config_accepts_platform_internal_http_endpoint() -> None:
+    config = KeystoneConfig.for_hosted_runner(
+        base_url="http://runner.internal/keystone",
+        token=SECRET,
+    )
+
+    assert config.endpoint == "http://runner.internal/keystone/api/mcp"
+
+
+def test_hosted_runner_config_preserves_platform_service_port() -> None:
+    config = KeystoneConfig.for_hosted_runner(
+        base_url="http://runner.internal:8080/keystone",
+        token=SECRET,
+    )
+
+    assert config.endpoint == "http://runner.internal:8080/keystone/api/mcp"
 
 
 @pytest.mark.parametrize(

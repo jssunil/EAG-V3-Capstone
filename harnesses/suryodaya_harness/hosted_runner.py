@@ -115,16 +115,12 @@ def load_hosted_environment(values: Mapping[str, object]) -> HostedEnvironment:
         port = supplied.port
     except ValueError:
         raise HostedConfigurationError("AGENTSWITCH_BASE_URL is malformed.") from None
-    if (
-        supplied.scheme.casefold() != "https"
-        or not supplied.hostname
-        or port not in (None, 443)
-        or supplied.query
-        or supplied.fragment
-        or supplied.username is not None
-        or supplied.password is not None
-    ):
-        raise HostedConfigurationError("AGENTSWITCH_BASE_URL must be a credential-free HTTPS instance URL.")
+    if supplied.scheme.casefold() not in {"http", "https"} or not supplied.hostname:
+        raise HostedConfigurationError("AGENTSWITCH_BASE_URL must be an absolute HTTP(S) instance URL.")
+    if supplied.username is not None or supplied.password is not None:
+        raise HostedConfigurationError("AGENTSWITCH_BASE_URL must not contain credentials.")
+    if supplied.query or supplied.fragment:
+        raise HostedConfigurationError("AGENTSWITCH_BASE_URL must not contain a query or fragment.")
 
     return HostedEnvironment(
         instance=instance,
