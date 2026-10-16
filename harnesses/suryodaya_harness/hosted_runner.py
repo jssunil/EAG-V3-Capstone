@@ -27,7 +27,6 @@ from calendar_agent.models import ToolCallRecord
 from calendar_agent.tools import ReadOnlyCalendarTool
 
 from harnesses.keystone_harness import (
-    DEFAULT_BASE_URL as KEYSTONE_BASE_URL,
     KeystoneClient,
     KeystoneClientError,
     KeystoneConfig,
@@ -108,35 +107,28 @@ def load_hosted_environment(values: Mapping[str, object]) -> HostedEnvironment:
         raise HostedConfigurationError("AGENTSWITCH_TOKEN must be set.")
 
     instance = instance_value.strip().casefold()
-    approved_origins = {
-        SURYOODAYA_INSTANCE: SURYOODAYA_BASE_URL,
-        KEYSTONE_INSTANCE: KEYSTONE_BASE_URL,
-    }
-    expected_origin = approved_origins.get(instance)
-    if expected_origin is None:
+    if instance not in (SURYOODAYA_INSTANCE, KEYSTONE_INSTANCE):
         raise HostedConfigurationError("AGENTSWITCH_INSTANCE is not an enabled harness target.")
 
     try:
         supplied = urlsplit(base_url_value.strip())
-        expected = urlsplit(expected_origin)
         port = supplied.port
     except ValueError:
         raise HostedConfigurationError("AGENTSWITCH_BASE_URL is malformed.") from None
     if (
         supplied.scheme.casefold() != "https"
-        or supplied.hostname != expected.hostname
+        or not supplied.hostname
         or port not in (None, 443)
-        or supplied.path not in ("", "/")
         or supplied.query
         or supplied.fragment
         or supplied.username is not None
         or supplied.password is not None
     ):
-        raise HostedConfigurationError("AGENTSWITCH_BASE_URL does not match the selected instance.")
+        raise HostedConfigurationError("AGENTSWITCH_BASE_URL must be a credential-free HTTPS instance URL.")
 
     return HostedEnvironment(
         instance=instance,
-        base_url=expected_origin,
+        base_url=base_url_value.strip().rstrip("/"),
         token=token_value.strip(),
     )
 
@@ -282,7 +274,7 @@ def run_hosted(
             )
         else:
             try:
-                keystone_config = KeystoneConfig(
+                keystone_config = KeystoneConfig.for_hosted_runner(
                     base_url=config.base_url,
                     token=config.token,
                 )

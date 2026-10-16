@@ -120,17 +120,27 @@ def test_hosted_environment_is_bound_to_selected_instance() -> None:
     assert "secret-token" not in repr(config)
 
 
-def test_hosted_environment_rejects_instance_url_mismatch() -> None:
+def test_hosted_environment_uses_platform_injected_secure_instance_url() -> None:
+    config = load_hosted_environment({
+        "AGENTSWITCH_INSTANCE": "suryodaya",
+        "AGENTSWITCH_BASE_URL": "https://runner.example.test/tenant/suryodaya",
+        "AGENTSWITCH_TOKEN": "secret-token",
+    })
+
+    assert config.base_url == "https://runner.example.test/tenant/suryodaya"
+
+
+def test_hosted_environment_rejects_insecure_instance_url() -> None:
     try:
         load_hosted_environment({
             "AGENTSWITCH_INSTANCE": "keystone",
-            "AGENTSWITCH_BASE_URL": "https://agentswitch.theschoolofai.in",
+            "AGENTSWITCH_BASE_URL": "http://runner.example.test/tenant/keystone",
             "AGENTSWITCH_TOKEN": "secret-token",
         })
     except HostedConfigurationError as exc:
-        assert "does not match" in str(exc)
+        assert "HTTPS" in str(exc)
     else:
-        raise AssertionError("A Suryodaya URL must not be accepted for Keystone.")
+        raise AssertionError("The runner must not send its token over HTTP.")
 
 
 def test_tool_trace_summary_does_not_include_party_data() -> None:

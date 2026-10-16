@@ -17,6 +17,30 @@ class KeystoneConfigurationError(ValueError):
     """Raised when Keystone connection settings do not meet the safety boundary."""
 
 
+def _validated_runner_base_url(value: object) -> str:
+    """Validate a platform-injected HTTPS base URL for discovery-only runner use."""
+
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise KeystoneConfigurationError("AGENTSWITCH_BASE_URL must be a valid HTTPS URL.")
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        raise KeystoneConfigurationError("AGENTSWITCH_BASE_URL must not contain whitespace or control characters.")
+    if "?" in value or "#" in value:
+        raise KeystoneConfigurationError("AGENTSWITCH_BASE_URL must not contain a query string or fragment.")
+
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise KeystoneConfigurationError("AGENTSWITCH_BASE_URL is malformed.") from None
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        raise KeystoneConfigurationError("AGENTSWITCH_BASE_URL must use HTTPS and include a host.")
+    if parsed.username is not None or parsed.password is not None:
+        raise KeystoneConfigurationError("AGENTSWITCH_BASE_URL must not contain URL credentials.")
+    if port not in (None, 443):
+        raise KeystoneConfigurationError("AGENTSWITCH_BASE_URL must use the standard HTTPS port.")
+    return value.rstrip("/")
+
+
 def _validated_base_url(value: object) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise KeystoneConfigurationError("KEYSTONE_BASE_URL must be a valid Keystone HTTPS origin.")
@@ -65,9 +89,15 @@ class KeystoneConfig:
     token: str | None = field(default=None, repr=False)
     connect_timeout_seconds: float = 3.05
     read_timeout_seconds: float = 10.0
+    _hosted_runner_origin: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "base_url", _validated_base_url(self.base_url))
+        validated_base_url = (
+            _validated_runner_base_url(self.base_url)
+            if self._hosted_runner_origin
+            else _validated_base_url(self.base_url)
+        )
+        object.__setattr__(self, "base_url", validated_base_url)
         object.__setattr__(
             self,
             "connect_timeout_seconds",
@@ -83,6 +113,16 @@ class KeystoneConfig:
                 raise KeystoneConfigurationError("KEYSTONE_TOKEN must be text when provided.")
             if any(character.isspace() for character in self.token):
                 raise KeystoneConfigurationError("KEYSTONE_TOKEN must not contain whitespace.")
+
+    @classmethod
+    def for_hosted_runner(cls, *, base_url: str, token: str) -> KeystoneConfig:
+        """Build discovery-only settings from the AgentSwitch runner environment."""
+
+        return cls(
+            base_url=base_url,
+            token=token,
+            _hosted_runner_origin=True,
+        )
 
     @classmethod
     def from_env(

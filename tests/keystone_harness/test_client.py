@@ -67,6 +67,30 @@ def test_default_keystone_origin_is_accepted() -> None:
     assert config.endpoint == f"{DEFAULT_BASE_URL}/api/mcp"
 
 
+def test_hosted_runner_config_accepts_secure_platform_endpoint() -> None:
+    config = KeystoneConfig.for_hosted_runner(
+        base_url="https://runner.example.test/tenant/keystone",
+        token=SECRET,
+    )
+
+    assert config.endpoint == "https://runner.example.test/tenant/keystone/api/mcp"
+    assert SECRET not in repr(config)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://runner.example.test",
+        "https://user:password@runner.example.test",
+        "https://runner.example.test?instance=keystone",
+        "https://runner.example.test:444",
+    ],
+)
+def test_hosted_runner_config_rejects_unsafe_endpoint(base_url: str) -> None:
+    with pytest.raises(KeystoneConfigurationError):
+        KeystoneConfig.for_hosted_runner(base_url=base_url, token=SECRET)
+
+
 @pytest.mark.parametrize(
     "destination",
     [
