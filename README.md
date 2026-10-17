@@ -68,12 +68,11 @@ These fixtures are local test data only. Planning remains distinct from executio
 
 ### Hosted AgentSwitch harness
 
-`agentswitch-harness.toml` configures the AgentSwitch server runner. It invokes `harnesses.suryodaya_harness.hosted_runner` once for each of Suryodaya and Keystone. The runner uses only the server-provided `AGENTSWITCH_*` instance settings, validates that the base URL is absolute HTTP(S) without embedded credentials, a query, or a fragment, and does not read local credentials or `.env` files.
+`agentswitch-harness.toml` selects Suryodaya only and invokes `harnesses.suryodaya_harness.hosted_runner`. The hosted process reads `AGENTSWITCH_INSTANCE`, `AGENTSWITCH_BASE_URL`, and `AGENTSWITCH_TOKEN` from the runner; it does not read local credentials or `.env` files. The base URL must be an absolute credential-free HTTPS instance base URL. The client appends `/api/mcp`, so that endpoint itself must not be supplied. Query strings and fragments are rejected.
 
-- Suryodaya runs `calendar.find_30_minutes` through the deterministic Calendar Agent and the read-only tool boundary, using a rolling 14-day search window. Its harness check passes only when the planner returns one independently validated 30-minute candidate; unresolved identity, unavailable data, or an invalid candidate is reported as unevaluated/non-passing with sanitized evidence.
-- Keystone performs only the MCP `tools/list` protocol request. It does not invoke any listed business operation. A non-empty, valid tool catalog passes this discovery check; this is not a Calendar goal result.
+The hosted check invokes the read-only `calendar.find_30_minutes` planner over a rolling 14-day window. A structurally verified candidate is still reported as `UNEVALUATED`: the official goal predicate is not available in this repository, and proposing a slot does not prove the business goal passed. Missing or invalid configuration also produces an unevaluated, non-passing result. The CLI's zero exit status means only that the result artifact was written; it does not mean a business goal passed. No event or booking mutation is attempted. The locally runnable `python -m harnesses.suryodaya_harness` demo remains fixture-based and does not submit or contact a live instance.
 
-These are harness checks, not the unavailable official evaluator predicates. No event or booking mutation is attempted. The locally runnable `python -m harnesses.suryodaya_harness` demo remains fixture-based and does not submit or contact either live instance.
+The repository does not establish the exact hosted Suryodaya URL. Obtain that value and its path/origin requirements from the authoritative runner configuration before submission; do not infer it from the local default URL.
 
 Replay and rescore an existing artifact without rerunning the Agent:
 

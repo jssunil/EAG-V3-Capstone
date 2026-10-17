@@ -12,10 +12,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from calendar_agent import (
+    AgentSwitchError,
     AgentSwitchCalendarTools,
     AgentSwitchClient,
     AgentSwitchConfig,
-    AgentSwitchError,
     AgentTask,
     CalendarTool,
     CalendarAgent,
@@ -26,21 +26,12 @@ from calendar_agent import (
 from calendar_agent.models import ToolCallRecord
 from calendar_agent.tools import ReadOnlyCalendarTool
 
-from harnesses.keystone_harness import (
-    KeystoneClient,
-    KeystoneClientError,
-    KeystoneConfig,
-    KeystoneConfigurationError,
-)
-
 from .assertions import verify_result
 from .results import MAX_EVIDENCE_LENGTH, sanitize_evidence, validate_results
 from .server_runner import ServerRunnerError, write_results_atomic
 
 
-SURYOODAYA_BASE_URL = "https://agentswitch.theschoolofai.in"
 SURYOODAYA_INSTANCE = "suryodaya"
-KEYSTONE_INSTANCE = "keystone"
 GOAL_ONE = "calendar.find_30_minutes"
 GOAL_ONE_TITLE = "Find 30 minutes with the plant head"
 _SEARCH_WINDOW = timedelta(days=14)
@@ -94,7 +85,7 @@ def _task(
 
 
 def load_hosted_environment(values: Mapping[str, object]) -> HostedEnvironment:
-    """Read the runner-provided target and enforce each instance's fixed origin."""
+    """Read the runner-provided target without substituting a local origin."""
 
     instance_value = values.get("AGENTSWITCH_INSTANCE")
     base_url_value = values.get("AGENTSWITCH_BASE_URL")
@@ -107,24 +98,35 @@ def load_hosted_environment(values: Mapping[str, object]) -> HostedEnvironment:
         raise HostedConfigurationError("AGENTSWITCH_TOKEN must be set.")
 
     instance = instance_value.strip().casefold()
-    if instance not in (SURYOODAYA_INSTANCE, KEYSTONE_INSTANCE):
-        raise HostedConfigurationError("AGENTSWITCH_INSTANCE is not an enabled harness target.")
+    if instance != SURYOODAYA_INSTANCE:
+        raise HostedConfigurationError("Only the Suryodaya harness target is enabled.")
 
+    base_url = base_url_value.strip()
+    if any(character.isspace() or ord(character) < 32 for character in base_url):
+        raise HostedConfigurationError("AGENTSWITCH_BASE_URL must not contain whitespace or control characters.")
     try:
-        supplied = urlsplit(base_url_value.strip())
-        port = supplied.port
+        supplied = urlsplit(base_url)
+        supplied.port
     except ValueError:
         raise HostedConfigurationError("AGENTSWITCH_BASE_URL is malformed.") from None
-    if supplied.scheme.casefold() not in {"http", "https"} or not supplied.hostname:
-        raise HostedConfigurationError("AGENTSWITCH_BASE_URL must be an absolute HTTP(S) instance URL.")
+    if supplied.scheme.casefold() != "https" or not supplied.hostname:
+        raise HostedConfigurationError(
+            "AGENTSWITCH_BASE_URL must be an absolute HTTPS instance base URL."
+        )
     if supplied.username is not None or supplied.password is not None:
-        raise HostedConfigurationError("AGENTSWITCH_BASE_URL must not contain credentials.")
+        raise HostedConfigurationError(
+            "AGENTSWITCH_BASE_URL must be a credential-free HTTPS instance base URL."
+        )
     if supplied.query or supplied.fragment:
         raise HostedConfigurationError("AGENTSWITCH_BASE_URL must not contain a query or fragment.")
+    if supplied.path.rstrip("/").casefold().endswith("/api/mcp"):
+        raise HostedConfigurationError(
+            "AGENTSWITCH_BASE_URL must be the instance base URL, not the /api/mcp endpoint."
+        )
 
     return HostedEnvironment(
         instance=instance,
-        base_url=base_url_value.strip().rstrip("/"),
+        base_url=base_url.rstrip("/"),
         token=token_value.strip(),
     )
 
@@ -144,7 +146,7 @@ def check_suryodaya_goal_one(
     now: datetime | None = None,
     secret_values: tuple[str, ...] = (),
 ) -> HostedCheck:
-    """Pass only when the read-only planner returns one structurally valid slot."""
+    """Record a read-only candidate check without claiming a goal predicate pass."""
 
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None or current.utcoffset() is None:
@@ -181,8 +183,12 @@ def check_suryodaya_goal_one(
         return _task(
             task_id="suryodaya.goal1_read_only_candidate",
             title="Suryodaya read-only Goal 1 candidate check",
-            passed=True,
-            evidence=evidence,
+            passed=False,
+            evidence=(
+                "UNEVALUATED: "
+                + evidence
+                + " No authoritative business-goal predicate was available."
+            ),
             secret_values=secret_values,
         )
 
@@ -197,39 +203,6 @@ def check_suryodaya_goal_one(
         title="Suryodaya read-only Goal 1 candidate check",
         passed=False,
         evidence=evidence,
-        secret_values=secret_values,
-    )
-
-
-def check_keystone_tool_discovery(
-    client: KeystoneClient,
-    *,
-    secret_values: tuple[str, ...] = (),
-) -> HostedCheck:
-    """Pass only when Keystone returns a valid, non-empty MCP tool catalog."""
-
-    try:
-        tools = client.list_tools()
-    except KeystoneClientError as exc:
-        evidence = f"UNEVALUATED: Keystone tools/list was unavailable ({type(exc).__name__})."
-        return _task(
-            task_id="keystone.mcp_tool_discovery",
-            title="Keystone MCP tool discovery",
-            passed=False,
-            evidence=evidence,
-            secret_values=secret_values,
-        )
-
-    read_only_hints = sum(tool.read_only_hint is True for tool in tools)
-    evidence = (
-        f"Keystone tools/list returned {len(tools)} tools; "
-        f"read_only_hints={read_only_hints}; no business tool was invoked."
-    )
-    return _task(
-        task_id="keystone.mcp_tool_discovery",
-        title="Keystone MCP tool discovery",
-        passed=bool(tools),
-        evidence=evidence if tools else f"UNEVALUATED: {evidence}",
         secret_values=secret_values,
     )
 
@@ -256,41 +229,42 @@ def run_hosted(
                 secret_values=secret_values,
             ),
         )
-        summary = "Hosted harness configuration could not be validated."
+        summary = (
+            "Hosted harness configuration could not be validated; "
+            "business_goal_predicates=unevaluated."
+        )
     else:
         if config.instance == SURYOODAYA_INSTANCE:
-            client_config = AgentSwitchConfig(base_url=config.base_url, token=config.token)
-            tools = AgentSwitchCalendarTools(AgentSwitchClient(client_config))
-            tasks = (
-                check_suryodaya_goal_one(
-                    tools,
-                    now=now,
-                    secret_values=secret_values,
-                ),
-            )
-        else:
             try:
-                keystone_config = KeystoneConfig.for_hosted_runner(
-                    base_url=config.base_url,
-                    token=config.token,
-                )
-                client = KeystoneClient(keystone_config)
-            except KeystoneConfigurationError as exc:
+                client_config = AgentSwitchConfig(base_url=config.base_url, token=config.token)
+                tools = AgentSwitchCalendarTools(AgentSwitchClient(client_config))
                 tasks = (
-                    _task(
-                        task_id="keystone.mcp_tool_discovery",
-                        title="Keystone MCP tool discovery",
-                        passed=False,
-                        evidence=f"UNEVALUATED: Keystone configuration failed ({type(exc).__name__}).",
+                    check_suryodaya_goal_one(
+                        tools,
+                        now=now,
                         secret_values=secret_values,
                     ),
                 )
-            else:
+            except (AgentSwitchError, ConfigurationError, MutationDisabledError) as exc:
                 tasks = (
-                    check_keystone_tool_discovery(client, secret_values=secret_values),
+                    _task(
+                        task_id="harness.execution",
+                        title="Suryodaya harness execution",
+                        passed=False,
+                        evidence=(
+                            "UNEVALUATED: hosted harness initialization or evaluation "
+                            f"stopped ({type(exc).__name__})."
+                        ),
+                        secret_values=secret_values,
+                    ),
                 )
+        else:
+            raise AssertionError("load_hosted_environment must reject non-Suryodaya instances")
         passed_count = sum(task.passed for task in tasks)
-        summary = f"{config.instance}: {passed_count}/{len(tasks)} harness checks passed."
+        summary = (
+            f"{config.instance}: {passed_count}/{len(tasks)} harness checks passed; "
+            "business_goal_predicates=unevaluated."
+        )
 
     document = {
         "tasks": [task.official_record() for task in tasks],
@@ -313,7 +287,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     passed_count = sum(task.passed for task in tasks)
-    print(f"Hosted harness wrote {output_path}; checks_passed={passed_count}/{len(tasks)}.")
+    print(
+        f"Hosted harness wrote {output_path}; harness_checks_passed="
+        f"{passed_count}/{len(tasks)}; business_goal_predicates=unevaluated."
+    )
     return 0
 
 

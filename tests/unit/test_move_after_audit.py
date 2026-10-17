@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from calendar_agent.agent import CalendarAgent
 from calendar_agent.models import AgentTask, ResultStatus
 from harnesses.suryodaya_harness.assertions import verify_rescheduling_plan, verify_result
@@ -22,13 +24,20 @@ SHIFT = timedelta(hours=1)
 AUDIT_END = datetime(2026, 9, 22, 10, tzinfo=timezone.utc)
 
 
-def event(event_id: str, start: str, end: str, *, title: str = "Work") -> dict[str, str]:
+def event(
+    event_id: str,
+    start: str,
+    end: str,
+    *,
+    title: str = "Work",
+    timezone_name: str = "UTC",
+) -> dict[str, str]:
     return {
         "id": event_id,
         "title": title,
         "start_at": start,
         "end_at": end,
-        "timezone": "UTC",
+        "timezone": timezone_name,
         "calendar_id": "calendar-1",
     }
 
@@ -79,6 +88,150 @@ def test_exactly_one_audit_plans_events_strictly_after_audit_end() -> None:
     assert not any(call.mutating for call in result.tool_calls)
 
 
+def test_equivalent_offsets_use_the_same_instant_for_audit_boundary() -> None:
+    result = run([
+        AUDIT,
+        event(
+            "at-audit-end",
+            "2026-09-22T11:00:00+01:00",
+            "2026-09-22T11:30:00+01:00",
+            timezone_name="Europe/London",
+        ),
+        event(
+            "after",
+            "2026-09-22T12:00:00+01:00",
+            "2026-09-22T13:00:00+01:00",
+            timezone_name="Europe/London",
+        ),
+    ])
+
+    assert result.status is ResultStatus.PLANNED
+    assert [move.event_id for move in result.rescheduling_plan] == ["after"]
+    assert result.rescheduling_plan[0].proposed_start_at == "2026-09-22T13:00:00+01:00"
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "expected_start", "expected_end"),
+    [
+        (
+            "2026-03-08T01:30:00-05:00",
+            "2026-03-08T03:30:00-04:00",
+            "2026-03-08T03:30:00-04:00",
+            "2026-03-08T04:30:00-04:00",
+        ),
+        (
+            "2026-11-01T01:30:00-04:00",
+            "2026-11-01T01:30:00-05:00",
+            "2026-11-01T01:30:00-05:00",
+            "2026-11-01T02:30:00-05:00",
+        ),
+    ],
+)
+def test_dst_shift_preserves_elapsed_time_and_emits_event_zone_offsets(
+    start: str,
+    end: str,
+    expected_start: str,
+    expected_end: str,
+) -> None:
+    audit = {
+        **AUDIT,
+        "start_at": "2026-03-07T23:00:00-05:00",
+        "end_at": "2026-03-07T23:30:00-05:00",
+    }
+    if "2026-11" in start:
+        audit = {
+            **AUDIT,
+            "start_at": "2026-10-31T23:00:00-04:00",
+            "end_at": "2026-10-31T23:30:00-04:00",
+        }
+    result = run([
+        audit,
+        event("after", start, end, timezone_name="America/New_York"),
+    ])
+
+    assert result.status is ResultStatus.PLANNED
+    move = result.rescheduling_plan[0]
+    assert move.proposed_start_at == expected_start
+    assert move.proposed_end_at == expected_end
+    assert move.duration_seconds == 3600
+    assert datetime.fromisoformat(move.proposed_start_at) - datetime.fromisoformat(move.original_start_at) == SHIFT
+    assert datetime.fromisoformat(move.proposed_end_at) - datetime.fromisoformat(move.original_end_at) == SHIFT
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ("2026-11-01T01:30:00", "2026-11-01T02:30:00"),
+        ("2026-03-08T02:30:00", "2026-03-08T03:30:00"),
+    ],
+)
+def test_ambiguous_or_nonexistent_local_timestamps_remain_fail_closed(
+    start: str,
+    end: str,
+) -> None:
+    audit = {
+        **AUDIT,
+        "start_at": "2026-10-31T12:00:00-04:00",
+        "end_at": "2026-10-31T12:30:00-04:00",
+    }
+    if "2026-03" in start:
+        audit = {
+            **AUDIT,
+            "start_at": "2026-03-07T12:00:00-05:00",
+            "end_at": "2026-03-07T12:30:00-05:00",
+        }
+    result = run([
+        audit,
+        event("after", start, end, timezone_name="America/New_York"),
+    ])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+
+
+def test_invalid_iana_zone_for_a_movable_event_requires_clarification() -> None:
+    result = run([
+        AUDIT,
+        event(
+            "after",
+            "2026-09-22T11:00:00+00:00",
+            "2026-09-22T12:00:00+00:00",
+            timezone_name="Not/A_Zone",
+        ),
+    ])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+
+
+def test_destination_conflict_is_detected_across_spring_forward_transition() -> None:
+    audit = {
+        **AUDIT,
+        "start_at": "2026-03-08T00:30:00-05:00",
+        "end_at": "2026-03-08T01:30:00-05:00",
+        "timezone": "America/New_York",
+    }
+    result = run([
+        audit,
+        event(
+            "overlap-audit",
+            "2026-03-08T01:00:00-05:00",
+            "2026-03-08T03:45:00-04:00",
+            timezone_name="America/New_York",
+        ),
+        event(
+            "after",
+            "2026-03-08T03:00:00-04:00",
+            "2026-03-08T03:30:00-04:00",
+            timezone_name="America/New_York",
+        ),
+    ], shift=timedelta(minutes=30))
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "conflict" in result.summary.lower()
+
+
 def test_audit_missing_from_full_listing_requires_clarification() -> None:
     result = run_with_split_listings([
         event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
@@ -111,6 +264,31 @@ def test_exactly_one_audit_in_full_listing_continues_valid_planning() -> None:
 
     assert result.status is ResultStatus.PLANNED
     assert [move.event_id for move in result.rescheduling_plan] == ["after"]
+
+
+def test_audit_search_at_record_limit_requires_clarification() -> None:
+    tools = FakeCalendarTools(events=[AUDIT.copy() for _ in range(1000)])
+
+    result = CalendarAgent(tools).run(
+        AgentTask("calendar.move_after_audit", "Move everything after the audit", {"shift": SHIFT})
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "may be incomplete" in result.summary
+    assert len(tools.trace) == 1
+
+
+def test_full_event_listing_at_record_limit_produces_no_plan() -> None:
+    events = [AUDIT, *(
+        event(f"after-{index}", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00")
+        for index in range(999)
+    )]
+    result = run_with_split_listings(events)
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "may be incomplete" in result.summary
 
 
 def test_multiple_audits_do_not_produce_a_plan() -> None:

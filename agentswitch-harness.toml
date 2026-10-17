@@ -2,5 +2,5 @@ install = "pip install -e ."
 run = "python -m harnesses.suryodaya_harness.hosted_runner"
 results = "results.json"
 
-instances = ["suryodaya", "keystone"]
+instances = ["suryodaya"]
 timeout_minutes = 20

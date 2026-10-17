@@ -83,6 +83,27 @@ def test_calendar_event_list_builds_mcp_request_and_returns_result() -> None:
     }
 
 
+def test_runner_instance_base_url_is_used_verbatim_for_mcp_and_bearer_auth() -> None:
+    session = FakeSession(FakeResponse({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"isError": False, "content": []},
+    }))
+    client = AgentSwitchClient(
+        AgentSwitchConfig(
+            base_url="https://runner.example.test:8443/tenant/suryodaya/",
+            token="runner-token",
+        ),
+        session=session,  # type: ignore[arg-type]
+    )
+
+    client.call_tool("CalendarEvent.list", {"limit": 1})
+
+    request = session.calls[0]
+    assert request["url"] == "https://runner.example.test:8443/tenant/suryodaya/api/mcp"
+    assert request["headers"]["Authorization"] == "Bearer runner-token"
+
+
 def test_json_rpc_error_is_raised() -> None:
     client, _ = make_client(
         FakeResponse(

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ..models import (
     AgentResult,
@@ -17,6 +18,7 @@ from ..tools import CalendarTool
 
 
 GOAL = "calendar.move_after_audit"
+_EVENT_LIST_LIMIT = 1000
 
 
 def _event_ref(event: dict[str, object]) -> CalendarEventRef:
@@ -60,9 +62,20 @@ def _parse_event_times(event: dict[str, Any]) -> tuple[datetime, datetime] | Non
     interval = _parse_event_interval(event)
     if interval is None:
         return None
-    if not isinstance(event.get("timezone"), str) or not event["timezone"].strip():
+    event_timezone = _event_timezone(event)
+    if event_timezone is None:
         return None
-    return interval
+    return tuple(value.astimezone(timezone.utc) for value in interval)
+
+
+def _event_timezone(event: dict[str, Any]) -> ZoneInfo | None:
+    timezone_name = event.get("timezone")
+    if not isinstance(timezone_name, str) or not timezone_name.strip():
+        return None
+    try:
+        return ZoneInfo(timezone_name.strip())
+    except (KeyError, OSError, ValueError):
+        return None
 
 
 def _parse_event_start(event: dict[str, Any]) -> datetime | None:
@@ -103,7 +116,15 @@ def _clarification(
 def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
     """Build a deterministic, read-only plan for events after one audit."""
 
-    audit_records = tools.list_events(limit=1000, search="audit")
+    audit_records = tools.list_events(limit=_EVENT_LIST_LIMIT, search="audit")
+    if len(audit_records) >= _EVENT_LIST_LIMIT:
+        reference = AuditReference(candidates=(), search_terms=("audit",))
+        return _clarification(
+            task,
+            reference,
+            "Audit resolution is blocked because the search may be incomplete.",
+            f"The audit search reached its {_EVENT_LIST_LIMIT}-record limit; a complete candidate set is unavailable.",
+        )
     audit_like = [event for event in audit_records if _is_audit_candidate(event)]
     candidates = tuple(_event_ref(event) for event in audit_like)
     reference = AuditReference(candidates=candidates, search_terms=("audit",))
@@ -153,7 +174,14 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             "Provide a positive timedelta shift; the planner will not invent one.",
         )
 
-    events = tools.list_events(limit=1000)
+    events = tools.list_events(limit=_EVENT_LIST_LIMIT)
+    if len(events) >= _EVENT_LIST_LIMIT:
+        return _clarification(
+            task,
+            reference,
+            "The affected-event set may be incomplete.",
+            f"The full event listing reached its {_EVENT_LIST_LIMIT}-record limit; no rescheduling plan was produced.",
+        )
     audit_id = _event_id(audit_event)
     assert audit_id is not None
     matching_audit_ids = sum(1 for event in events if _event_id(event) == audit_id)
@@ -194,14 +222,18 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
         event_start, event_end = parsed
         if event_start <= audit_end:
             continue
+        event_timezone = _event_timezone(event)
+        if event_timezone is None:
+            timezone_ambiguous.append(event)
+            continue
         if event_id is None:
             identity_ambiguous.append(event)
             continue
         if event_id in move_ids:
             duplicate_move_ids.add(event_id)
             continue
-        proposed_start = event_start + shift
-        proposed_end = event_end + shift
+        proposed_start = (event_start + shift).astimezone(event_timezone)
+        proposed_end = (event_end + shift).astimezone(event_timezone)
         move_ids.add(event_id)
         moves.append(
             EventMove(
