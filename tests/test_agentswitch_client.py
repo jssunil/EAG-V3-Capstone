@@ -4,6 +4,8 @@ import pytest
 import requests
 
 from calendar_agent import (
+    AgentSwitchAuthenticationError,
+    AgentSwitchBudgetExhaustedError,
     AgentSwitchClient,
     AgentSwitchConfig,
     AgentSwitchHttpError,
@@ -153,6 +155,20 @@ def test_http_error_is_raised_without_response_body() -> None:
     client, _ = make_client(FakeResponse({"ignored": True}, status_code=503))
 
     with pytest.raises(AgentSwitchHttpError, match="503"):
+        client.call_tool("CalendarEvent.list", {"limit": 1})
+
+
+def test_http_401_is_classified_as_authentication_failure() -> None:
+    client, _ = make_client(FakeResponse({"ignored": True}, status_code=401))
+
+    with pytest.raises(AgentSwitchAuthenticationError, match="401"):
+        client.call_tool("CalendarEvent.list", {"limit": 1})
+
+
+def test_http_429_is_classified_as_budget_exhaustion() -> None:
+    client, _ = make_client(FakeResponse({"ignored": True}, status_code=429))
+
+    with pytest.raises(AgentSwitchBudgetExhaustedError, match="budget_exhausted"):
         client.call_tool("CalendarEvent.list", {"limit": 1})
 
 

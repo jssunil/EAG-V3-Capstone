@@ -6,13 +6,16 @@ from typing import Any
 import pytest
 
 from calendar_agent import (
+    AgentSwitchAuthenticationError,
+    AgentSwitchBudgetExhaustedError,
     AgentSwitchCalendarTools,
     AgentSwitchToolError,
     CalendarAgent,
     MutationDisabledError,
     ResultStatus,
 )
-from calendar_agent.models import AgentTask
+from calendar_agent.models import AgentTask, CalendarEventPage
+from calendar_agent.tools import CalendarEventListError
 
 
 MUTATION_TOOLS = {
@@ -28,7 +31,7 @@ MUTATION_TOOLS = {
 class FakeAgentSwitchClient:
     def __init__(
         self,
-        responses: dict[str, list[dict[str, Any]]],
+        responses: dict[str, list[dict[str, Any] | Exception]],
         *,
         failure: tuple[str, Exception] | None = None,
     ) -> None:
@@ -43,11 +46,30 @@ class FakeAgentSwitchClient:
         values = self.responses[name]
         if not values:
             raise AssertionError(f"No fake MCP response remains for {name}")
-        return values.pop(0)
+        response = values.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def records(*items: dict[str, Any]) -> dict[str, Any]:
     return {"structuredContent": {"data": list(items)}}
+
+
+def event_page(
+    *items: dict[str, Any],
+    total: int,
+    limit: int = 1000,
+    offset: int = 0,
+) -> dict[str, Any]:
+    return {
+        "structuredContent": {
+            "data": list(items),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+    }
 
 
 def free_busy_result() -> dict[str, Any]:
@@ -63,6 +85,61 @@ def free_busy_result() -> dict[str, Any]:
             }
         }
     }
+
+
+def test_event_page_adapter_preserves_pagination_metadata() -> None:
+    audit = {"id": "audit-1", "title": "Audit"}
+    client = FakeAgentSwitchClient({
+        "CalendarEvent.list": [event_page(audit, total=3, limit=2, offset=2)],
+    })
+    tools = AgentSwitchCalendarTools(client)
+
+    page = tools.list_events_page(
+        calendar_id="calendar-1",
+        limit=2,
+        offset=2,
+    )
+
+    assert page == CalendarEventPage((audit,), total=3, limit=2, offset=2)
+    assert client.calls == [
+        ("CalendarEvent.list", {
+            "calendar_id": "calendar-1",
+            "limit": 2,
+            "offset": 2,
+        })
+    ]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        records({"id": "event-1"}),
+        {"structuredContent": {"data": [{"id": "event-1"}], "total": 1, "limit": 2}},
+        event_page({"id": "event-1"}, total=1, limit=0),
+        event_page({"id": "event-1"}, total=1, limit=3),
+        event_page({"id": "event-1"}, total=1, offset=1),
+        event_page({"id": "event-1"}, total=0),
+        event_page({"id": "event-1"}, total=1, limit=0),
+        event_page(
+            {"id": "event-1"},
+            {"id": "event-2"},
+            total=2,
+            limit=1,
+        ),
+    ],
+)
+def test_event_page_adapter_rejects_missing_or_inconsistent_metadata(
+    response: dict[str, Any],
+) -> None:
+    client = FakeAgentSwitchClient({"CalendarEvent.list": [response]})
+    tools = AgentSwitchCalendarTools(client)
+
+    with pytest.raises(CalendarEventListError):
+        tools.list_events_page(calendar_id="calendar-1", limit=2, offset=0)
+
+    assert len(tools.trace) == 1
+    assert not tools.trace[0].succeeded
+    assert tools.trace[0].error == "CalendarEventListError"
 
 
 def test_goal_one_runs_through_mcp_adapter_to_agent_result() -> None:
@@ -150,8 +227,127 @@ def test_goal_two_runs_through_mcp_adapter_to_agent_result() -> None:
         "calendar_id": "calendar-1",
     }
     client = FakeAgentSwitchClient({
-        "CalendarEvent.list": [records(audit), records(audit, after)],
+        "CalendarEvent.list": [
+            event_page(audit, total=1),
+            event_page(audit, after, total=2),
+        ],
     })
+    tools = AgentSwitchCalendarTools(client)
+
+    result = CalendarAgent(tools).run(
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": timedelta(hours=1), "calendar_id": "calendar-1"},
+        )
+    )
+
+    assert result.status is ResultStatus.PLANNED
+    assert [move.event_id for move in result.rescheduling_plan] == ["work-1"]
+    assert result.rescheduling_plan[0].proposed_start_at == "2026-09-22T12:00:00+00:00"
+    assert result.rescheduling_plan[0].proposed_end_at == "2026-09-22T13:00:00+00:00"
+    assert result.claimed_outcome["moved"] is False
+    assert client.calls == [
+        ("CalendarEvent.list", {
+            "calendar_id": "calendar-1",
+            "limit": 1000,
+            "offset": 0,
+            "search": "audit",
+        }),
+        ("CalendarEvent.list", {
+            "calendar_id": "calendar-1",
+            "limit": 1000,
+            "offset": 0,
+        }),
+    ]
+    assert [call.tool for call in result.tool_calls] == [name for name, _ in client.calls]
+    assert not any(name in MUTATION_TOOLS for name, _ in client.calls)
+
+
+def test_goal_two_paginates_partial_pages_and_scopes_every_request() -> None:
+    audit = {
+        "id": "audit-1",
+        "title": "Internal quality audit",
+        "start_at": "2026-09-22T09:00:00+00:00",
+        "end_at": "2026-09-22T10:00:00+00:00",
+        "timezone": "UTC",
+        "calendar_id": "calendar-1",
+    }
+    before = {
+        "id": "before-1",
+        "title": "Before",
+        "start_at": "2026-09-22T08:00:00+00:00",
+        "end_at": "2026-09-22T08:30:00+00:00",
+        "timezone": "UTC",
+        "calendar_id": "calendar-1",
+    }
+    after = {
+        "id": "after-1",
+        "title": "After",
+        "start_at": "2026-09-22T11:00:00+00:00",
+        "end_at": "2026-09-22T12:00:00+00:00",
+        "timezone": "UTC",
+        "calendar_id": "calendar-1",
+    }
+    client = FakeAgentSwitchClient({
+        "CalendarEvent.list": [
+            event_page(audit, total=1, limit=2),
+            event_page(audit, before, total=3, limit=2),
+            event_page(after, total=3, limit=2, offset=2),
+        ],
+    })
+    tools = AgentSwitchCalendarTools(client)
+
+    result = CalendarAgent(tools).run(
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": timedelta(hours=1), "calendar_id": "calendar-1"},
+        )
+    )
+
+    assert result.status is ResultStatus.PLANNED
+    assert [move.event_id for move in result.rescheduling_plan] == ["after-1"]
+    assert [arguments["offset"] for _, arguments in client.calls] == [0, 0, 2]
+    assert all(arguments["calendar_id"] == "calendar-1" for _, arguments in client.calls)
+
+
+def test_goal_two_mid_pagination_failure_produces_no_plan() -> None:
+    audit = {
+        "id": "audit-1",
+        "title": "Internal quality audit",
+        "start_at": "2026-09-22T09:00:00+00:00",
+        "end_at": "2026-09-22T10:00:00+00:00",
+        "timezone": "UTC",
+        "calendar_id": "calendar-1",
+    }
+    client = FakeAgentSwitchClient({
+        "CalendarEvent.list": [
+            event_page(audit, total=1),
+            event_page(audit, total=2, limit=1),
+            AgentSwitchToolError("synthetic second-page failure"),
+        ],
+    })
+    tools = AgentSwitchCalendarTools(client)
+
+    result = CalendarAgent(tools).run(
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": timedelta(hours=1), "calendar_id": "calendar-1"},
+        )
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "incomplete" in result.summary.lower()
+    assert [arguments["offset"] for _, arguments in client.calls] == [0, 0, 1]
+    assert not tools.trace[-1].succeeded
+    assert not any(call.mutating for call in result.tool_calls)
+
+
+def test_goal_two_requires_explicit_calendar_scope() -> None:
+    client = FakeAgentSwitchClient({"CalendarEvent.list": []})
     tools = AgentSwitchCalendarTools(client)
 
     result = CalendarAgent(tools).run(
@@ -162,17 +358,37 @@ def test_goal_two_runs_through_mcp_adapter_to_agent_result() -> None:
         )
     )
 
-    assert result.status is ResultStatus.PLANNED
-    assert [move.event_id for move in result.rescheduling_plan] == ["work-1"]
-    assert result.rescheduling_plan[0].proposed_start_at == "2026-09-22T12:00:00+00:00"
-    assert result.rescheduling_plan[0].proposed_end_at == "2026-09-22T13:00:00+00:00"
-    assert result.claimed_outcome["moved"] is False
-    assert client.calls == [
-        ("CalendarEvent.list", {"limit": 1000, "search": "audit"}),
-        ("CalendarEvent.list", {"limit": 1000}),
-    ]
-    assert [call.tool for call in result.tool_calls] == [name for name, _ in client.calls]
-    assert not any(name in MUTATION_TOOLS for name, _ in client.calls)
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "calendar scope" in result.summary.lower()
+    assert client.calls == []
+
+
+def test_goal_two_rejects_results_from_outside_the_requested_calendar() -> None:
+    audit = {
+        "id": "audit-1",
+        "title": "Internal quality audit",
+        "start_at": "2026-09-22T09:00:00+00:00",
+        "end_at": "2026-09-22T10:00:00+00:00",
+        "timezone": "UTC",
+        "calendar_id": "another-calendar",
+    }
+    client = FakeAgentSwitchClient({
+        "CalendarEvent.list": [event_page(audit, total=1)],
+    })
+    tools = AgentSwitchCalendarTools(client)
+
+    result = CalendarAgent(tools).run(
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": timedelta(hours=1), "calendar_id": "calendar-1"},
+        )
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert client.calls[0][1]["calendar_id"] == "calendar-1"
 
 
 def test_adapter_read_failure_is_recorded_and_propagates() -> None:
@@ -190,6 +406,24 @@ def test_adapter_read_failure_is_recorded_and_propagates() -> None:
     assert tools.trace[0].tool == "Party.list"
     assert not tools.trace[0].succeeded
     assert tools.trace[0].error == "AgentSwitchToolError"
+
+    for error_type in (
+        AgentSwitchAuthenticationError,
+        AgentSwitchBudgetExhaustedError,
+    ):
+        page_tools = AgentSwitchCalendarTools(
+            FakeAgentSwitchClient({
+                "CalendarEvent.list": [error_type("synthetic HTTP failure")],
+            })
+        )
+        with pytest.raises(error_type):
+            page_tools.list_events_page(
+                calendar_id="calendar-1",
+                limit=1000,
+                offset=0,
+            )
+        assert not page_tools.trace[-1].succeeded
+        assert page_tools.trace[-1].error == error_type.__name__
 
 
 def test_adapter_mutation_boundary_fails_closed() -> None:

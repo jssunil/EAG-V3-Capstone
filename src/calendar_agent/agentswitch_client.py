@@ -23,6 +23,14 @@ class AgentSwitchHttpError(AgentSwitchError):
     """Raised when AgentSwitch returns a non-success HTTP status."""
 
 
+class AgentSwitchAuthenticationError(AgentSwitchHttpError):
+    """Raised when AgentSwitch rejects authentication with HTTP 401."""
+
+
+class AgentSwitchBudgetExhaustedError(AgentSwitchHttpError):
+    """Raised when AgentSwitch reports an exhausted budget with HTTP 429."""
+
+
 class AgentSwitchProtocolError(AgentSwitchError):
     """Raised when the response is not a valid JSON-RPC/MCP result."""
 
@@ -84,6 +92,14 @@ class AgentSwitchClient:
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
+            if response.status_code == 401:
+                raise AgentSwitchAuthenticationError(
+                    "AgentSwitch returned HTTP 401 (authentication failed)"
+                ) from exc
+            if response.status_code == 429:
+                raise AgentSwitchBudgetExhaustedError(
+                    "AgentSwitch returned HTTP 429 (budget_exhausted)"
+                ) from exc
             raise AgentSwitchHttpError(
                 f"AgentSwitch returned HTTP {response.status_code}"
             ) from exc

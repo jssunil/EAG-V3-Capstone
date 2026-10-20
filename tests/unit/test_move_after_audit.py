@@ -4,8 +4,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import calendar_agent.goals.move_after_audit as move_after_audit
 from calendar_agent.agent import CalendarAgent
-from calendar_agent.models import AgentTask, ResultStatus
+from calendar_agent.models import AgentResult, AgentTask, CalendarEventPage, ResultStatus
+from calendar_agent.tools import CalendarEventListError
 from harnesses.suryodaya_harness.assertions import verify_rescheduling_plan, verify_result
 
 from .fakes import FakeCalendarTools
@@ -55,7 +57,9 @@ class SplitAuditListingTools(FakeCalendarTools):
 
 
 def run(events: list[dict[str, object]], *, shift: timedelta | None = SHIFT):
-    context = {"shift": shift} if shift is not None else {}
+    context = {"calendar_id": "calendar-1"}
+    if shift is not None:
+        context["shift"] = shift
     return CalendarAgent(FakeCalendarTools(events=events)).run(
         AgentTask("calendar.move_after_audit", "Move everything after the audit", context)
     )
@@ -63,8 +67,56 @@ def run(events: list[dict[str, object]], *, shift: timedelta | None = SHIFT):
 
 def run_with_split_listings(full_listing: list[dict[str, object]]):
     return CalendarAgent(SplitAuditListingTools(full_listing)).run(
-        AgentTask("calendar.move_after_audit", "Move everything after the audit", {"shift": SHIFT})
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": SHIFT, "calendar_id": "calendar-1"},
+        )
     )
+
+
+class ScriptedEventPages(FakeCalendarTools):
+    def __init__(
+        self,
+        search_pages: list[CalendarEventPage | Exception],
+        full_pages: list[CalendarEventPage | Exception],
+    ) -> None:
+        super().__init__()
+        self.pages = {"audit": list(search_pages), "full": list(full_pages)}
+
+    def list_events_page(self, **filters: object) -> CalendarEventPage:
+        self._record("CalendarEvent.list", filters)
+        key = "audit" if filters.get("search") == "audit" else "full"
+        response = self.pages[key].pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def page(
+    *records: dict[str, object],
+    total: int,
+    limit: int,
+    offset: int,
+) -> CalendarEventPage:
+    return CalendarEventPage(tuple(records), total, limit, offset)
+
+
+def run_with_pages(
+    search_pages: list[CalendarEventPage | Exception],
+    full_pages: list[CalendarEventPage | Exception],
+    *,
+    calendar_id: str = "calendar-1",
+) -> tuple[AgentResult, ScriptedEventPages]:
+    tools = ScriptedEventPages(search_pages, full_pages)
+    result = CalendarAgent(tools).run(
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": SHIFT, "calendar_id": calendar_id},
+        )
+    )
+    return result, tools
 
 
 def test_exactly_one_audit_plans_events_strictly_after_audit_end() -> None:
@@ -270,7 +322,11 @@ def test_audit_search_at_record_limit_requires_clarification() -> None:
     tools = FakeCalendarTools(events=[AUDIT.copy() for _ in range(1000)])
 
     result = CalendarAgent(tools).run(
-        AgentTask("calendar.move_after_audit", "Move everything after the audit", {"shift": SHIFT})
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": SHIFT, "calendar_id": "calendar-1"},
+        )
     )
 
     assert result.status is ResultStatus.NEEDS_CLARIFICATION
@@ -320,7 +376,14 @@ def test_event_overlapping_audit_is_not_selected() -> None:
 def test_malformed_event_with_unknown_position_requires_clarification() -> None:
     result = run([
         AUDIT,
-        {"id": "malformed", "title": "Broken", "start_at": "not-a-date", "end_at": "also-broken", "timezone": "UTC"},
+        {
+            "id": "malformed",
+            "title": "Broken",
+            "start_at": "not-a-date",
+            "end_at": "also-broken",
+            "timezone": "UTC",
+            "calendar_id": "calendar-1",
+        },
         event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
     ])
 
@@ -429,6 +492,17 @@ def test_duplicate_affected_event_ids_do_not_produce_a_plan() -> None:
     assert not result.rescheduling_plan
 
 
+def test_duplicate_event_ids_across_audit_boundary_do_not_produce_a_plan() -> None:
+    result = run([
+        AUDIT,
+        event("x", "2026-09-22T09:00:00+00:00", "2026-09-22T09:30:00+00:00"),
+        event("x", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
+    ])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+
+
 def test_affected_event_sharing_audit_id_does_not_produce_a_plan() -> None:
     result = run([
         AUDIT,
@@ -451,7 +525,11 @@ def test_successful_planning_does_not_mutate_source_events() -> None:
     before = deepcopy(tools.events)
 
     result = CalendarAgent(tools).run(
-        AgentTask("calendar.move_after_audit", "Move everything after the audit", {"shift": SHIFT})
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": SHIFT, "calendar_id": "calendar-1"},
+        )
     )
 
     assert result.status is ResultStatus.PLANNED
@@ -466,3 +544,150 @@ def test_missing_shift_is_clarification() -> None:
     assert result.status is ResultStatus.NEEDS_CLARIFICATION
     assert not result.rescheduling_plan
     assert "amount" in result.summary.lower()
+
+
+def test_complete_pagination_plans_after_short_first_page() -> None:
+    before = event("before", "2026-09-22T08:00:00+00:00", "2026-09-22T08:30:00+00:00")
+    after = event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00")
+    result, tools = run_with_pages(
+        [page(AUDIT, total=1, limit=2, offset=0)],
+        [
+            page(AUDIT, before, total=3, limit=2, offset=0),
+            page(after, total=3, limit=2, offset=2),
+        ],
+    )
+
+    assert result.status is ResultStatus.PLANNED
+    assert [move.event_id for move in result.rescheduling_plan] == ["after"]
+    assert [call.arguments["offset"] for call in tools.trace] == [0, 0, 2]
+    assert all(call.arguments["calendar_id"] == "calendar-1" for call in tools.trace)
+
+
+def test_changed_total_between_pages_fails_closed() -> None:
+    after = event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00")
+    result, _ = run_with_pages(
+        [page(AUDIT, total=1, limit=2, offset=0)],
+        [
+            page(AUDIT, total=2, limit=1, offset=0),
+            page(after, total=3, limit=1, offset=1),
+        ],
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "total changed" in " ".join(result.ambiguities)
+
+
+@pytest.mark.parametrize(
+    "invalid_page",
+    [
+        page(AUDIT, total=2, limit=1, offset=1),
+        page(AUDIT, total=2, limit=1001, offset=0),
+        page(AUDIT, total=0, limit=1, offset=0),
+    ],
+)
+def test_invalid_page_offsets_and_limits_fail_closed(
+    invalid_page: CalendarEventPage,
+) -> None:
+    result, _ = run_with_pages(
+        [page(AUDIT, total=1, limit=2, offset=0)],
+        [invalid_page],
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+
+
+def test_repeated_event_page_fails_closed() -> None:
+    repeated = {
+        "title": "Repeated page record",
+        "start_at": "2026-09-22T11:00:00+00:00",
+        "end_at": "2026-09-22T12:00:00+00:00",
+        "timezone": "UTC",
+        "calendar_id": "calendar-1",
+    }
+    result, _ = run_with_pages(
+        [page(AUDIT, total=1, limit=1, offset=0)],
+        [
+            page(repeated, total=2, limit=1, offset=0),
+            page(repeated, total=2, limit=1, offset=1),
+        ],
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "repeated page" in " ".join(result.ambiguities)
+
+
+def test_empty_page_before_reported_total_fails_closed() -> None:
+    result, _ = run_with_pages(
+        [page(AUDIT, total=1, limit=1, offset=0)],
+        [page(total=2, limit=1, offset=0)],
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+
+
+def test_fetch_failure_mid_pagination_fails_closed() -> None:
+    result, tools = run_with_pages(
+        [page(AUDIT, total=1, limit=1, offset=0)],
+        [
+            page(AUDIT, total=2, limit=1, offset=0),
+            CalendarEventListError("synthetic second-page failure"),
+        ],
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "incomplete" in result.summary.lower()
+    assert len(tools.trace) == 3
+
+
+def test_missing_calendar_scope_does_not_query_global_events() -> None:
+    tools = FakeCalendarTools(events=[AUDIT])
+    result = CalendarAgent(tools).run(
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": SHIFT},
+        )
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert tools.trace == []
+
+
+def test_legacy_list_without_page_metadata_cannot_produce_a_plan() -> None:
+    tools = FakeCalendarTools(events=[AUDIT, event(
+        "after",
+        "2026-09-22T11:00:00+00:00",
+        "2026-09-22T12:00:00+00:00",
+    )])
+    tools.list_events_page = None
+
+    result = CalendarAgent(tools).run(
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": SHIFT, "calendar_id": "calendar-1"},
+        )
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "pagination metadata" in " ".join(result.ambiguities)
+    assert tools.trace == []
+
+
+def test_page_count_safety_limit_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(move_after_audit, "_MAX_EVENT_LIST_PAGES", 1)
+    result, _ = run_with_pages(
+        [page(AUDIT, total=1, limit=1, offset=0)],
+        [page(AUDIT, total=2, limit=1, offset=0)],
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "page safety limit" in " ".join(result.ambiguities)

@@ -292,20 +292,19 @@ def test_audit_plan_moves_only_strictly_after_end_and_preserves_duration_order_a
     result = CalendarAgent(tools).run(AgentTask(
         "calendar.move_after_audit",
         "Move everything after the supplier audit",
-        {"shift": timedelta(hours=1)},
+        {"shift": timedelta(hours=1), "calendar_id": "calendar-1"},
     ))
 
     assert result.status is ResultStatus.PLANNED
-    assert [move.event_id for move in result.rescheduling_plan] == ["after-1", "after-2"]
-    assert [move.calendar_id for move in result.rescheduling_plan] == ["calendar-1", "calendar-2"]
+    assert [move.event_id for move in result.rescheduling_plan] == ["after-1"]
+    assert [move.calendar_id for move in result.rescheduling_plan] == ["calendar-1"]
     assert result.rescheduling_plan[0].duration_seconds == 3600
-    assert result.rescheduling_plan[1].duration_seconds == 5400
     assert tools.events == before
     assert result.claimed_outcome["moved"] is False
     assert verify_rescheduling_plan(
         result,
         expected_audit_id="audit-1",
-        expected_event_ids=["after-1", "after-2"],
+        expected_event_ids=["after-1"],
         audit_end=datetime(2026, 9, 22, 11, 30, tzinfo=timezone.utc),
         shift=timedelta(hours=1),
     ).passed

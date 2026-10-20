@@ -1,6 +1,8 @@
 """Seat 19 Calendar Agent integration components."""
 
 from .agentswitch_client import (
+    AgentSwitchAuthenticationError,
+    AgentSwitchBudgetExhaustedError,
     AgentSwitchClient,
     AgentSwitchError,
     AgentSwitchHttpError,
@@ -79,6 +81,8 @@ from .evaluation import (
     score_persisted_run,
 )
 __all__ = [
+    "AgentSwitchAuthenticationError",
+    "AgentSwitchBudgetExhaustedError",
     "AgentSwitchClient",
     "AgentSwitchConfig",
     "AgentSwitchError",

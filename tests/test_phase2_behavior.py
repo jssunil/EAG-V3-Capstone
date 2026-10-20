@@ -108,7 +108,11 @@ def event(event_id: str, start: str, end: str, *, title: str = "Work") -> dict[s
 
 def run_goal_two(events: list[dict[str, Any]], *, shift: timedelta = timedelta(hours=1)):
     return CalendarAgent(FakeCalendarTools(events=events)).run(
-        AgentTask("calendar.move_after_audit", "Move everything after the audit", {"shift": shift})
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": shift, "calendar_id": "calendar-1"},
+        )
     )
 
 
@@ -286,7 +290,11 @@ def test_goal_two_boundary_filtering_is_strict_and_preserves_source_state() -> N
     before = deepcopy(tools.events)
 
     result = CalendarAgent(tools).run(
-        AgentTask("calendar.move_after_audit", "Move everything after the audit", {"shift": timedelta(hours=1)})
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": timedelta(hours=1), "calendar_id": "calendar-1"},
+        )
     )
 
     assert result.status is ResultStatus.PLANNED
@@ -349,7 +357,11 @@ def test_goal_two_attendee_state_is_unchanged_even_when_planning_proposes_moves(
     before_attendees = deepcopy(attendees)
 
     result = CalendarAgent(tools).run(
-        AgentTask("calendar.move_after_audit", "Move everything after the audit", {"shift": timedelta(hours=1)})
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"shift": timedelta(hours=1), "calendar_id": "calendar-1"},
+        )
     )
 
     assert result.status is ResultStatus.PLANNED

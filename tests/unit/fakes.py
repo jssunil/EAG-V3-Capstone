@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Sequence
 
-from calendar_agent.models import MutationDisabledError, ToolCallRecord
+from calendar_agent.models import CalendarEventPage, MutationDisabledError, ToolCallRecord
 
 
 class FakeCalendarTools:
@@ -52,7 +52,38 @@ class FakeCalendarTools:
 
     def list_events(self, **filters: Any) -> list[dict[str, Any]]:
         self._record("CalendarEvent.list", filters)
-        return self.events
+        calendar_id = filters.get("calendar_id")
+        search = filters.get("search")
+        if calendar_id is None and not search:
+            return self.events
+        events = self.events
+        if calendar_id is not None:
+            events = [
+                event for event in events
+                if event.get("calendar_id") == calendar_id
+            ]
+        if isinstance(search, str) and search:
+            search_lower = search.casefold()
+            events = [
+                event for event in events
+                if search_lower in " ".join(
+                    str(event.get(field) or "") for field in ("title", "description")
+                ).casefold()
+            ]
+        return events
+
+    def list_events_page(self, **filters: Any) -> CalendarEventPage:
+        """Page the complete in-memory fixture and report its exact total."""
+
+        events = self.list_events(**filters)
+        limit = filters["limit"]
+        offset = filters["offset"]
+        return CalendarEventPage(
+            records=tuple(events[offset : offset + limit]),
+            total=len(events),
+            limit=limit,
+            offset=offset,
+        )
 
     def get_event(self, event_id: str) -> dict[str, Any]:
         self._record("CalendarEvent.get", {"id": event_id})

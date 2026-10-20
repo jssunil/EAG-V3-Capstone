@@ -6,6 +6,8 @@ from typing import Any, cast
 import pytest
 
 from calendar_agent import (
+    AgentSwitchAuthenticationError,
+    AgentSwitchBudgetExhaustedError,
     AgentPolicy,
     BoundedAgentRuntime,
     CalendarAgent,
@@ -409,7 +411,7 @@ def test_runtime_selects_goal_two_and_builds_agent_task() -> None:
     model = FakeModel(SelectGoal(
         goal="calendar.move_after_audit",
         instruction="Move everything after the audit",
-        context={"shift": timedelta(hours=1)},
+        context={"shift": timedelta(hours=1), "calendar_id": "calendar-1"},
     ))
     agent = CalendarAgent(goal_two_tools())
 
@@ -538,7 +540,7 @@ def test_runtime_accepts_existing_typed_context_values() -> None:
     model = FakeModel(SelectGoal(
         "calendar.move_after_audit",
         "Move everything after the audit",
-        {"shift": timedelta(hours=1)},
+        {"shift": timedelta(hours=1), "calendar_id": "calendar-1"},
     ))
     tools = goal_two_tools()
 
@@ -583,6 +585,31 @@ def test_runtime_captures_model_failure() -> None:
     assert raw_run.steps_used == 1
     assert raw_run.retries_used == 0
 
+    auth_model = FakeModel(error=AgentSwitchAuthenticationError("authentication failed"))
+    policy = AgentPolicy(model=auth_model, max_model_steps=5, retry_ceiling=2)
+    auth_run = BoundedAgentRuntime(
+        CalendarAgent(FakeCalendarTools()),
+        auth_model,
+        policy=policy,
+    ).run("Find time")
+
+    assert auth_run.termination_reason is TerminationReason.MODEL_FAILURE
+    assert auth_run.error == "AgentSwitchAuthenticationError"
+    assert auth_run.steps_used == 1
+    assert auth_run.retries_used == 0
+    assert auth_model.calls == 1
+
+
+def test_runtime_classifies_model_budget_exhaustion() -> None:
+    model = FakeModel(error=AgentSwitchBudgetExhaustedError("budget_exhausted"))
+
+    raw_run = BoundedAgentRuntime(CalendarAgent(FakeCalendarTools()), model).run("Find time")
+
+    assert raw_run.termination_reason is TerminationReason.BUDGET_EXHAUSTED
+    assert raw_run.error == "budget_exhausted"
+    assert raw_run.steps_used == 1
+    assert raw_run.retries_used == 0
+
 
 def test_runtime_enforces_retry_ceiling() -> None:
     model = FakeModel(error=RuntimeError("model unavailable"))
@@ -605,6 +632,24 @@ def test_runtime_stops_at_zero_model_step_budget() -> None:
     assert raw_run.termination_reason is TerminationReason.BUDGET_EXHAUSTED
     assert raw_run.steps_used == 0
     assert model.calls == 0
+
+
+def test_runtime_classifies_calendar_tool_budget_exhaustion() -> None:
+    class BudgetExhaustedTools(FakeCalendarTools):
+        def find_parties(self, **filters: Any) -> list[dict[str, Any]]:
+            raise AgentSwitchBudgetExhaustedError("budget_exhausted")
+
+    model = FakeModel(SelectGoal("calendar.find_30_minutes", "Find time", {}))
+
+    raw_run = BoundedAgentRuntime(
+        CalendarAgent(BudgetExhaustedTools()),
+        model,
+    ).run("Find time")
+
+    assert raw_run.termination_reason is TerminationReason.BUDGET_EXHAUSTED
+    assert raw_run.error == "budget_exhausted"
+    assert raw_run.task is not None
+    assert raw_run.steps_used == 1
 
 
 def test_runtime_preserves_agent_result_and_tool_trace_in_raw_run() -> None:
@@ -666,11 +711,15 @@ def test_harness_runs_goal_two_through_bounded_runtime_and_verifies_result() -> 
     model = FakeModel(SelectGoal(
         "calendar.move_after_audit",
         "Move everything after the audit",
-        {"shift": timedelta(hours=1)},
+        {"shift": timedelta(hours=1), "calendar_id": "calendar-1"},
     ))
 
     report = Harness(goal_two_tools()).run(
-        AgentTask("calendar.move_after_audit", "Move everything after the audit"),
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"calendar_id": "calendar-1"},
+        ),
         expected_status=ResultStatus.PLANNED,
         model=model,
     )

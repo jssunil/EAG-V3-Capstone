@@ -12,6 +12,7 @@ from .client import (
     KeystoneClient,
     KeystoneClientError,
     KeystoneOperationNotAllowedError,
+    KeystoneProtocolError,
 )
 from .authorization import (
     RESOURCE_READ_OPERATIONS,
@@ -41,6 +42,16 @@ class KeystoneListRequest:
 
     tool_name: str
     arguments: dict[str, Any]
+
+
+class _KeystonePageSchemaValidationError(KeystoneProtocolError):
+    def __init__(
+        self,
+        message: str,
+        requests: tuple[KeystoneListRequest, ...],
+    ) -> None:
+        self.requests = requests
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -424,11 +435,17 @@ class KeystoneCalendarAdapter:
             except KeystoneClientError as exc:
                 read_error = type(exc).__name__
                 break
-            validate_json_schema_instance(
-                self._client.validate_read_authorization(authorization).output_schema,
-                response,
-                location="synthetic structured resource response",
-            )
+            try:
+                validate_json_schema_instance(
+                    self._client.validate_read_authorization(authorization).output_schema,
+                    response,
+                    location="synthetic structured resource response",
+                )
+            except KeystoneProtocolError as exc:
+                raise _KeystonePageSchemaValidationError(
+                    str(exc),
+                    tuple(requests),
+                ) from exc
             if not isinstance(response, Mapping):
                 pages.append({})
             else:

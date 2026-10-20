@@ -68,13 +68,29 @@ def test_plant_manager_ambiguity_is_explicit() -> None:
 def test_multiple_audits_are_not_arbitrarily_selected() -> None:
     tools = FakeCalendarTools(
         events=[
-            {"id": "audit-1", "title": "Internal quality audit", "start_at": "2026-09-19T09:30", "end_at": "2026-09-19T12:30"},
-            {"id": "audit-2", "title": "Supplier quality audit", "start_at": "2026-09-28T10:00", "end_at": "2026-09-28T11:00"},
+            {
+                "id": "audit-1",
+                "title": "Internal quality audit",
+                "start_at": "2026-09-19T09:30",
+                "end_at": "2026-09-19T12:30",
+                "calendar_id": "calendar-1",
+            },
+            {
+                "id": "audit-2",
+                "title": "Supplier quality audit",
+                "start_at": "2026-09-28T10:00",
+                "end_at": "2026-09-28T11:00",
+                "calendar_id": "calendar-1",
+            },
         ]
     )
 
     result = CalendarAgent(tools).run(
-        AgentTask("calendar.move_after_audit", "Move everything after the audit")
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the audit",
+            {"calendar_id": "calendar-1"},
+        )
     )
 
     assert result.status is ResultStatus.NEEDS_CLARIFICATION

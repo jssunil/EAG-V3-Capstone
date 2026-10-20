@@ -44,6 +44,17 @@ from .calendar_adapter import (
     map_event_attendee_record,
     map_party_record,
 )
+from .goal_integration import (
+    KeystoneAuthorizationFailureError,
+    KeystoneCalendarTool,
+    KeystoneCapabilityUnavailableError,
+    KeystoneGoalIntegrationError,
+    KeystoneIncompleteDataError,
+    KeystoneRecordMappingError,
+    KeystoneResourceReadError,
+    KeystoneSchemaValidationError,
+    run_keystone_goal,
+)
 from .pagination import ResourceCollectionResult, collect_resource_pages
 from .discovery import (
     PRODUCTION_OPERATION_REGISTRY,
@@ -92,6 +103,15 @@ __all__ = [
     "KeystoneListRequest",
     "KeystoneMappedRecord",
     "KeystoneResourceListResult",
+    "KeystoneAuthorizationFailureError",
+    "KeystoneCalendarTool",
+    "KeystoneCapabilityUnavailableError",
+    "KeystoneGoalIntegrationError",
+    "KeystoneIncompleteDataError",
+    "KeystoneRecordMappingError",
+    "KeystoneResourceReadError",
+    "KeystoneSchemaValidationError",
+    "run_keystone_goal",
     "RESOURCE_READ_OPERATIONS",
     "validate_resource_read_policy",
     "validate_json_schema_instance",

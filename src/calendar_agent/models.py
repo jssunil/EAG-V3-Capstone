@@ -67,6 +67,49 @@ class PartyPage:
 
 
 @dataclass(frozen=True)
+class CalendarEventPage:
+    records: tuple[dict[str, Any], ...]
+    total: int
+    limit: int
+    offset: int
+
+    @property
+    def next_offset(self) -> int:
+        return self.offset + len(self.records)
+
+    @property
+    def has_more(self) -> bool:
+        return self.next_offset < self.total
+
+    def validate(self, *, requested_limit: int, requested_offset: int) -> None:
+        if type(requested_limit) is not int or requested_limit < 1:
+            raise ValueError("requested event page limit must be positive")
+        if type(requested_offset) is not int or requested_offset < 0:
+            raise ValueError("requested event page offset must be non-negative")
+        if (
+            not isinstance(self.records, tuple)
+            or any(not isinstance(record, dict) for record in self.records)
+        ):
+            raise ValueError("event page records must be a tuple of objects")
+        if type(self.total) is not int or self.total < 0:
+            raise ValueError("event page total must be a non-negative integer")
+        if (
+            type(self.limit) is not int
+            or self.limit < 1
+            or self.limit > requested_limit
+        ):
+            raise ValueError("event page limit is invalid")
+        if type(self.offset) is not int or self.offset != requested_offset:
+            raise ValueError("event page offset does not match the request")
+        if self.offset > self.total or len(self.records) > self.limit:
+            raise ValueError("event page record count is inconsistent")
+        if self.next_offset > self.total:
+            raise ValueError("event page extends beyond the reported total")
+        if self.has_more and not self.records:
+            raise ValueError("event page made no progress while records remain")
+
+
+@dataclass(frozen=True)
 class EventAttendee:
     event_id: str
     party_id: str | None

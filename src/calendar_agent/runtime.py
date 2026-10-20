@@ -10,6 +10,10 @@ from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
 from .agent import CalendarAgent
+from .agentswitch_client import (
+    AgentSwitchAuthenticationError,
+    AgentSwitchBudgetExhaustedError,
+)
 from .models import AgentResult, AgentTask, ResultStatus, ToolCallRecord
 from .planner import HANDLERS
 from .tools import ReadOnlyCalendarTool
@@ -207,6 +211,32 @@ class BoundedAgentRuntime:
             steps_used += 1
             try:
                 decision = self.model.decide(request)
+            except AgentSwitchBudgetExhaustedError:
+                return self._raw_run(
+                    user_instruction,
+                    supplied_context,
+                    decisions,
+                    task,
+                    result,
+                    tool_trace,
+                    "budget_exhausted",
+                    steps_used,
+                    retries_used,
+                    TerminationReason.BUDGET_EXHAUSTED,
+                )
+            except AgentSwitchAuthenticationError as exc:
+                return self._raw_run(
+                    user_instruction,
+                    supplied_context,
+                    decisions,
+                    task,
+                    result,
+                    tool_trace,
+                    type(exc).__name__,
+                    steps_used,
+                    retries_used,
+                    TerminationReason.MODEL_FAILURE,
+                )
             except Exception as exc:
                 if retries_used < self.policy.retry_ceiling and steps_used < self.policy.max_model_steps:
                     retries_used += 1
@@ -374,6 +404,20 @@ class BoundedAgentRuntime:
             trace_start = len(self.calendar_agent.tools.trace)
             try:
                 result = self.calendar_agent.run(task)
+            except AgentSwitchBudgetExhaustedError:
+                tool_trace = tuple(self.calendar_agent.tools.trace[trace_start:])
+                return self._raw_run(
+                    user_instruction,
+                    supplied_context,
+                    decisions,
+                    task,
+                    result,
+                    tool_trace,
+                    "budget_exhausted",
+                    steps_used,
+                    retries_used,
+                    TerminationReason.BUDGET_EXHAUSTED,
+                )
             except Exception as exc:
                 tool_trace = tuple(self.calendar_agent.tools.trace[trace_start:])
                 return self._raw_run(

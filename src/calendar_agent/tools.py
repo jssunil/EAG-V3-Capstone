@@ -10,8 +10,20 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Protocol, Sequence
 
-from .agentswitch_client import AgentSwitchClient
-from .models import MutationDisabledError, ToolCallRecord
+from .agentswitch_client import (
+    AgentSwitchAuthenticationError,
+    AgentSwitchBudgetExhaustedError,
+    AgentSwitchClient,
+    AgentSwitchError,
+)
+from .models import CalendarEventPage, MutationDisabledError, ToolCallRecord
+
+
+_MAX_EVENT_PAGE_SIZE = 1000
+
+
+class CalendarEventListError(RuntimeError):
+    """Raised when a CalendarEvent listing cannot be proven complete."""
 
 
 class CalendarTool(Protocol):
@@ -66,7 +78,7 @@ class ReadOnlyCalendarTool:
         return self._delegate.trace
 
     def __getattr__(self, name: str) -> Any:
-        if name != "find_parties_page":
+        if name not in {"find_parties_page", "list_events_page"}:
             raise AttributeError(name)
         return getattr(self._delegate, name)
 
@@ -81,6 +93,9 @@ class ReadOnlyCalendarTool:
 
     def list_events(self, **filters: Any) -> list[dict[str, Any]]:
         return self._delegate.list_events(**filters)
+
+    def list_events_page(self, **filters: Any) -> CalendarEventPage:
+        return self._delegate.list_events_page(**filters)
 
     def get_event(self, event_id: str) -> dict[str, Any]:
         return self._delegate.get_event(event_id)
@@ -169,6 +184,52 @@ class AgentSwitchCalendarTools:
     def list_events(self, **filters: Any) -> list[dict[str, Any]]:
         return self._records(self._read("CalendarEvent.list", filters))
 
+    def list_events_page(self, **filters: Any) -> CalendarEventPage:
+        requested_limit = filters.get("limit")
+        requested_offset = filters.get("offset")
+        if (
+            type(requested_limit) is not int
+            or requested_limit < 1
+            or requested_limit > _MAX_EVENT_PAGE_SIZE
+            or type(requested_offset) is not int
+            or requested_offset < 0
+        ):
+            raise CalendarEventListError(
+                "CalendarEvent pagination requires a positive limit and non-negative offset."
+            )
+
+        try:
+            result = self._read("CalendarEvent.list", filters)
+        except (AgentSwitchAuthenticationError, AgentSwitchBudgetExhaustedError):
+            raise
+        except AgentSwitchError as exc:
+            raise CalendarEventListError(
+                "CalendarEvent page retrieval failed."
+            ) from exc
+
+        try:
+            structured = result.get("structuredContent")
+            if not isinstance(structured, dict):
+                raise ValueError("structuredContent is missing")
+            records = structured.get("data")
+            total = structured.get("total")
+            limit = structured.get("limit")
+            offset = structured.get("offset")
+            if not isinstance(records, list):
+                raise ValueError("data is missing or not a list")
+            page = CalendarEventPage(tuple(records), total, limit, offset)
+            page.validate(
+                requested_limit=requested_limit,
+                requested_offset=requested_offset,
+            )
+            return page
+        except (TypeError, ValueError) as exc:
+            error = CalendarEventListError(
+                f"CalendarEvent page metadata is invalid: {exc}"
+            )
+            self._mark_last_read_failed(error)
+            raise error from exc
+
     def get_event(self, event_id: str) -> dict[str, Any]:
         return self._read("CalendarEvent.get", {"id": event_id}).get("structuredContent", {})
 
@@ -195,6 +256,18 @@ class AgentSwitchCalendarTools:
 
     def list_scheduling_preferences(self, **filters: Any) -> list[dict[str, Any]]:
         return self._records(self._read("SchedulingPreferences.list", filters))
+
+    def _mark_last_read_failed(self, error: Exception) -> None:
+        if not self.trace:
+            return
+        last_call = self.trace[-1]
+        if last_call.tool == "CalendarEvent.list" and last_call.succeeded:
+            self.trace[-1] = ToolCallRecord(
+                tool=last_call.tool,
+                arguments=last_call.arguments,
+                succeeded=False,
+                error=type(error).__name__,
+            )
 
     def _mutation_disabled(self, tool: str, arguments: dict[str, Any]) -> None:
         self.trace.append(ToolCallRecord(tool, arguments, mutating=True, succeeded=False, error="disabled"))
