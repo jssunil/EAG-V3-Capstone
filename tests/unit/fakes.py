@@ -53,14 +53,20 @@ class FakeCalendarTools:
     def list_events(self, **filters: Any) -> list[dict[str, Any]]:
         self._record("CalendarEvent.list", filters)
         calendar_id = filters.get("calendar_id")
+        event_number = filters.get("number")
         search = filters.get("search")
-        if calendar_id is None and not search:
+        if calendar_id is None and event_number is None and not search:
             return self.events
         events = self.events
         if calendar_id is not None:
             events = [
                 event for event in events
                 if event.get("calendar_id") == calendar_id
+            ]
+        if event_number is not None:
+            events = [
+                event for event in events
+                if event.get("number") == event_number
             ]
         if isinstance(search, str) and search:
             search_lower = search.casefold()

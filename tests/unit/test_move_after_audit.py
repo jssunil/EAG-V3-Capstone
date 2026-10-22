@@ -56,10 +56,17 @@ class SplitAuditListingTools(FakeCalendarTools):
         return self.full_listing
 
 
-def run(events: list[dict[str, object]], *, shift: timedelta | None = SHIFT):
+def run(
+    events: list[dict[str, object]],
+    *,
+    shift: timedelta | None = SHIFT,
+    fallback_timezone: str | None = None,
+):
     context = {"calendar_id": "calendar-1"}
     if shift is not None:
         context["shift"] = shift
+    if fallback_timezone is not None:
+        context["naive_timestamp_timezone"] = fallback_timezone
     return CalendarAgent(FakeCalendarTools(events=events)).run(
         AgentTask("calendar.move_after_audit", "Move everything after the audit", context)
     )
@@ -86,7 +93,11 @@ class ScriptedEventPages(FakeCalendarTools):
 
     def list_events_page(self, **filters: object) -> CalendarEventPage:
         self._record("CalendarEvent.list", filters)
-        key = "audit" if filters.get("search") == "audit" else "full"
+        key = (
+            "audit"
+            if filters.get("search") == "audit" or filters.get("number") is not None
+            else "full"
+        )
         response = self.pages[key].pop(0)
         if isinstance(response, Exception):
             raise response
@@ -117,6 +128,49 @@ def run_with_pages(
         )
     )
     return result, tools
+
+
+def run_with_exact_audit_pages(
+    audit_pages: list[CalendarEventPage | Exception],
+    full_pages: list[CalendarEventPage | Exception],
+    *,
+    shift: timedelta | None = SHIFT,
+    calendar_id: str | None = None,
+    fallback_timezone: str | None = None,
+) -> tuple[AgentResult, ScriptedEventPages]:
+    tools = ScriptedEventPages(audit_pages, full_pages)
+    context: dict[str, object] = {
+        "audit_number": "EVT-2026-00007",
+        "audit_title": "Internal quality audit — press shop and welding",
+    }
+    if shift is not None:
+        context["shift"] = shift
+    if calendar_id is not None:
+        context["calendar_id"] = calendar_id
+    if fallback_timezone is not None:
+        context["naive_timestamp_timezone"] = fallback_timezone
+    result = CalendarAgent(tools).run(
+        AgentTask(
+            "calendar.move_after_audit",
+            "Move everything after the specified internal quality audit",
+            context,
+        )
+    )
+    return result, tools
+
+
+def exact_audit(**overrides: object) -> dict[str, object]:
+    return {
+        "id": "audit-uuid",
+        "number": "EVT-2026-00007",
+        "title": "Internal quality audit — press shop and welding",
+        "start_at": "2026-09-19T09:30:00+05:30",
+        "end_at": "2026-09-19T12:30:00+05:30",
+        "timezone": "Asia/Kolkata",
+        "calendar_id": "calendar-1",
+        "status": "confirmed",
+        **overrides,
+    }
 
 
 def test_exactly_one_audit_plans_events_strictly_after_audit_end() -> None:
@@ -196,10 +250,14 @@ def test_dst_shift_preserves_elapsed_time_and_emits_event_zone_offsets(
             "start_at": "2026-10-31T23:00:00-04:00",
             "end_at": "2026-10-31T23:30:00-04:00",
         }
-    result = run([
-        audit,
-        event("after", start, end, timezone_name="America/New_York"),
-    ])
+    after = {
+        **event("after", start, end),
+        "timezone": None,
+    }
+    result = run(
+        [audit, after],
+        fallback_timezone="America/New_York",
+    )
 
     assert result.status is ResultStatus.PLANNED
     move = result.rescheduling_plan[0]
@@ -404,7 +462,7 @@ def test_malformed_end_before_audit_cannot_hide_a_destination_conflict() -> None
     assert any("uncertain" in ambiguity for ambiguity in result.ambiguities)
 
 
-def test_unrelated_pre_audit_interval_without_timezone_is_not_blanket_rejected() -> None:
+def test_unrelated_pre_audit_interval_uses_explicit_fallback() -> None:
     without_timezone = event("before", "2026-09-22T07:00:00+00:00", "2026-09-22T08:00:00+00:00")
     del without_timezone["timezone"]
 
@@ -412,7 +470,7 @@ def test_unrelated_pre_audit_interval_without_timezone_is_not_blanket_rejected()
         AUDIT,
         without_timezone,
         event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
-    ])
+    ], fallback_timezone="UTC")
 
     assert result.status is ResultStatus.PLANNED
     assert [move.event_id for move in result.rescheduling_plan] == ["after"]
@@ -538,12 +596,311 @@ def test_successful_planning_does_not_mutate_source_events() -> None:
     assert not any(call.mutating for call in result.tool_calls)
 
 
-def test_missing_shift_is_clarification() -> None:
-    result = run([AUDIT, event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00")], shift=None)
+def test_missing_shift_proposes_thirty_minutes_and_requires_confirmation() -> None:
+    result = run(
+        [AUDIT, event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00")],
+        shift=None,
+    )
+
+    assert result.status is ResultStatus.PLANNED
+    assert result.claimed_outcome["shift"] == timedelta(minutes=30)
+    assert result.claimed_outcome["shift_was_proposed"] is True
+    assert result.claimed_outcome["confirmation_required"] is True
+    assert "proposed 30-minute shift" in result.claimed_outcome["confirmation_prompt"]
+    assert result.claimed_outcome["moved"] is False
+    assert not any(call.mutating for call in result.tool_calls)
+
+
+def test_exact_audit_number_derives_calendar_and_returns_confirmation_request() -> None:
+    target = exact_audit()
+    before = event("before", "2026-09-19T08:00:00+05:30", "2026-09-19T09:00:00+05:30")
+    boundary = event("boundary", "2026-09-19T12:30:00+05:30", "2026-09-19T13:00:00+05:30")
+    after = {
+        **event("work-uuid", "2026-09-19T13:30:00+05:30", "2026-09-19T14:30:00+05:30"),
+        "number": "EVT-2026-00008",
+        "status": "confirmed",
+    }
+    result, tools = run_with_exact_audit_pages(
+        [page(target, total=1, limit=10, offset=0)],
+        [page(target, before, boundary, after, total=4, limit=10, offset=0)],
+    )
+
+    assert result.status is ResultStatus.PLANNED
+    assert result.audit_reference is not None
+    assert [candidate.id for candidate in result.audit_reference.candidates] == [
+        "EVT-2026-00007"
+    ]
+    assert [move.event_id for move in result.rescheduling_plan] == ["work-uuid"]
+    assert result.rescheduling_plan[0].calendar_id == "calendar-1"
+    assert result.rescheduling_plan[0].duration_seconds == 3600
+    assert result.claimed_outcome["moved"] is False
+    assert result.claimed_outcome["confirmation_required"] is True
+    assert "confirm" in result.claimed_outcome["confirmation_prompt"].lower()
+    assert not any(call.mutating for call in result.tool_calls)
+    assert tools.trace[0].arguments["number"] == "EVT-2026-00007"
+    assert "calendar_id" not in tools.trace[0].arguments
+    assert all(
+        call.arguments["calendar_id"] == "calendar-1"
+        for call in tools.trace[1:]
+    )
+
+
+@pytest.mark.parametrize(
+    ("audit_overrides", "summary_fragment"),
+    [
+        ({"title": "Other audit"}, "different audit title"),
+        ({"status": "tentative"}, "not verified as confirmed"),
+        ({"calendar_id": None}, "no verified calendar association"),
+    ],
+)
+def test_exact_audit_requires_expected_title_confirmed_status_and_calendar(
+    audit_overrides: dict[str, object],
+    summary_fragment: str,
+) -> None:
+    result, tools = run_with_exact_audit_pages(
+        [page(exact_audit(**audit_overrides), total=1, limit=10, offset=0)],
+        [],
+    )
 
     assert result.status is ResultStatus.NEEDS_CLARIFICATION
     assert not result.rescheduling_plan
-    assert "amount" in result.summary.lower()
+    assert summary_fragment in result.summary
+    assert len(tools.trace) == 1
+    assert not any(call.mutating for call in result.tool_calls)
+
+
+def test_exact_audit_rejects_a_caller_calendar_that_does_not_match() -> None:
+    result, tools = run_with_exact_audit_pages(
+        [page(exact_audit(), total=1, limit=10, offset=0)],
+        [],
+        calendar_id="another-calendar",
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "does not match the audit's associated calendar" in result.summary
+    assert len(tools.trace) == 1
+    assert not any(call.mutating for call in result.tool_calls)
+
+
+def test_duplicate_exact_audit_numbers_require_clarification() -> None:
+    duplicate = exact_audit(id="audit-uuid-duplicate")
+    result, tools = run_with_exact_audit_pages(
+        [
+            page(
+                exact_audit(),
+                duplicate,
+                total=2,
+                limit=10,
+                offset=0,
+            )
+        ],
+        [],
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert len(result.audit_reference.candidates) == 2
+    assert "found 2" in " ".join(result.ambiguities)
+    assert len(tools.trace) == 1
+    assert not any(call.mutating for call in result.tool_calls)
+
+
+def test_exact_audit_missing_shift_proposes_thirty_minutes_and_waits() -> None:
+    target = exact_audit()
+    after = {
+        **event(
+            "work-uuid",
+            "2026-09-19T13:30:00+05:30",
+            "2026-09-19T14:30:00+05:30",
+        ),
+        "number": "EVT-2026-00008",
+    }
+    result, tools = run_with_exact_audit_pages(
+        [page(target, total=1, limit=10, offset=0)],
+        [page(target, after, total=2, limit=10, offset=0)],
+        shift=None,
+    )
+
+    assert result.status is ResultStatus.PLANNED
+    assert result.claimed_outcome["shift"] == timedelta(minutes=30)
+    assert result.claimed_outcome["shift_was_proposed"] is True
+    assert result.claimed_outcome["confirmation_required"] is True
+    assert result.claimed_outcome["moved"] is False
+    assert [move.event_id for move in result.rescheduling_plan] == ["work-uuid"]
+    assert not any(call.mutating for call in result.tool_calls)
+    assert len(tools.trace) == 2
+
+
+def test_exact_audit_naive_interval_uses_event_level_timezone() -> None:
+    target = exact_audit(
+        start_at="2026-09-19T09:30:00",
+        end_at="2026-09-19T12:30:00",
+    )
+    after = {
+        **event(
+            "work-uuid",
+            "2026-09-19T13:30:00",
+            "2026-09-19T14:30:00",
+            timezone_name="Asia/Kolkata",
+        ),
+        "number": "EVT-2026-00008",
+    }
+    result, tools = run_with_exact_audit_pages(
+        [page(target, total=1, limit=10, offset=0)],
+        [page(target, after, total=2, limit=10, offset=0)],
+    )
+
+    assert result.status is ResultStatus.PLANNED
+    assert result.rescheduling_plan[0].original_start_at == "2026-09-19T13:30:00+05:30"
+    assert result.rescheduling_plan[0].proposed_start_at == "2026-09-19T14:30:00+05:30"
+    assert len(tools.trace) == 2
+    assert not any(call.mutating for call in result.tool_calls)
+
+
+def test_naive_suryodaya_timestamps_use_explicit_kolkata_fallback() -> None:
+    target = exact_audit(
+        start_at="2026-09-19T09:30:00",
+        end_at="2026-09-19T12:30:00",
+        timezone=None,
+    )
+    after = {
+        **event(
+            "work-uuid",
+            "2026-09-19T13:30:00",
+            "2026-09-19T14:30:00",
+            timezone_name="UTC",
+        ),
+        "timezone": None,
+        "number": "EVT-2026-00008",
+    }
+    result, _ = run_with_exact_audit_pages(
+        [page(target, total=1, limit=10, offset=0)],
+        [page(target, after, total=2, limit=10, offset=0)],
+        fallback_timezone="Asia/Kolkata",
+    )
+
+    assert result.status is ResultStatus.PLANNED
+    move = result.rescheduling_plan[0]
+    assert move.original_start_at == "2026-09-19T13:30:00+05:30"
+    assert move.proposed_start_at == "2026-09-19T14:30:00+05:30"
+    assert move.original_end_at == "2026-09-19T14:30:00+05:30"
+    assert move.duration_seconds == 3600
+    assert result.audit_reference is not None
+    assert result.audit_reference.candidates[0].start_at == "2026-09-19T09:30:00+05:30"
+    assert result.claimed_outcome["moved"] is False
+    assert result.claimed_outcome["confirmation_required"] is True
+
+
+def test_missing_or_invalid_timezone_fails_closed() -> None:
+    target = exact_audit(
+        start_at="2026-09-19T09:30:00",
+        end_at="2026-09-19T12:30:00",
+        timezone=None,
+    )
+    after = {
+        **event("work-uuid", "2026-09-19T13:30:00", "2026-09-19T14:30:00"),
+        "timezone": None,
+        "number": "EVT-2026-00008",
+    }
+    unconfigured, _ = run_with_exact_audit_pages(
+        [page(target, total=1, limit=10, offset=0)],
+        [page(target, after, total=2, limit=10, offset=0)],
+    )
+    invalid_fallback, _ = run_with_exact_audit_pages(
+        [page(target, total=1, limit=10, offset=0)],
+        [page(target, after, total=2, limit=10, offset=0)],
+        fallback_timezone="Mars/Phobos",
+    )
+    invalid_event_zone, _ = run_with_exact_audit_pages(
+        [page(exact_audit(), total=1, limit=10, offset=0)],
+        [page(
+            exact_audit(),
+            {**after, "timezone": "Mars/Phobos"},
+            total=2,
+            limit=10,
+            offset=0,
+        )],
+        fallback_timezone="Asia/Kolkata",
+    )
+
+    assert unconfigured.status is ResultStatus.NEEDS_CLARIFICATION
+    assert invalid_fallback.status is ResultStatus.NEEDS_CLARIFICATION
+    assert invalid_event_zone.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not unconfigured.rescheduling_plan
+    assert not invalid_fallback.rescheduling_plan
+    assert not invalid_event_zone.rescheduling_plan
+
+
+def test_mixed_aware_and_naive_interval_preserves_offset_instant_and_duration() -> None:
+    result = run([
+        {
+            **AUDIT,
+            "start_at": "2026-09-22T09:00:00",
+            "end_at": "2026-09-22T10:00:00+05:30",
+            "timezone": None,
+        },
+        {
+            **event(
+                "mixed",
+                "2026-09-22T11:00:00",
+                "2026-09-22T06:30:00Z",
+                timezone_name="UTC",
+            ),
+            "timezone": None,
+        },
+    ], fallback_timezone="Asia/Kolkata")
+
+    assert result.status is ResultStatus.PLANNED
+    move = result.rescheduling_plan[0]
+    assert move.original_start_at == "2026-09-22T11:00:00+05:30"
+    assert move.original_end_at == "2026-09-22T06:30:00Z"
+    assert move.proposed_start_at == "2026-09-22T12:00:00+05:30"
+    assert move.duration_seconds == 3600
+
+
+def test_fallback_events_are_sorted_chronologically_and_conflicts_are_checked() -> None:
+    result = run([
+        {
+            **AUDIT,
+            "start_at": "2026-09-22T09:00:00",
+            "end_at": "2026-09-22T10:00:00",
+            "timezone": None,
+        },
+        {
+            **event("later", "2026-09-22T13:15:00Z", "2026-09-22T13:45:00Z"),
+            "timezone": None,
+        },
+        {
+            **event("earlier", "2026-09-22T11:00:00", "2026-09-22T11:30:00"),
+            "timezone": None,
+        },
+    ], fallback_timezone="Asia/Kolkata")
+
+    assert result.status is ResultStatus.PLANNED
+    assert [move.event_id for move in result.rescheduling_plan] == ["earlier", "later"]
+    assert [move.duration_seconds for move in result.rescheduling_plan] == [1800, 1800]
+
+    conflict = run([
+        {
+            **AUDIT,
+            "start_at": "2026-09-22T09:00:00",
+            "end_at": "2026-09-22T10:00:00",
+            "timezone": None,
+        },
+        {
+            **event("overlap-audit", "2026-09-22T09:30:00", "2026-09-22T11:45:00"),
+            "timezone": None,
+        },
+        {
+            **event("after", "2026-09-22T11:00:00", "2026-09-22T12:00:00"),
+            "timezone": None,
+        },
+    ], shift=timedelta(minutes=30), fallback_timezone="Asia/Kolkata")
+
+    assert conflict.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not conflict.rescheduling_plan
+    assert "conflict" in conflict.summary.lower()
 
 
 def test_complete_pagination_plans_after_short_first_page() -> None:

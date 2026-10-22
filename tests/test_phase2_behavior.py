@@ -43,15 +43,58 @@ def goal_one_context(**overrides: Any) -> dict[str, Any]:
     return context
 
 
-def visible_free_busy(busy: list[dict[str, str]]) -> dict[str, Any]:
+def visible_free_busy(
+    busy: list[dict[str, str]],
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> dict[str, Any]:
+    intervals = [
+        {
+            **interval,
+            "calendar_id": interval.get("calendar_id", "calendar-1"),
+            "start_at": interval.get("start_at", interval.get("start", "")),
+            "end_at": interval.get("end_at", interval.get("end", "")),
+            "all_day": False,
+            "transparency": "busy",
+            "detail_level": "free_busy",
+        }
+        for interval in busy
+    ]
+    calendars = [{
+        "calendar_id": "calendar-1",
+        "calendar_name": "My Calendar",
+        "access_level": "free_busy",
+        "actual_access_level": "free_busy",
+        "access_source": "grant",
+    }]
     return {
         "result": {
-            "subjects": [{
-                "subject": "plant@example.test",
-                "visibility": "free_busy",
-                "busy": busy,
-                "calendars": [{"access_level": "free_busy"}],
-            }],
+            "ok": True,
+            "window": {
+                "start": (start or goal_one_context()["start"]).isoformat(),
+                "end": (end or goal_one_context()["end"]).isoformat(),
+            },
+            "subjects": [
+                {
+                    "subject": "plant@example.test",
+                    "subject_kind": "email",
+                    "visibility": "visible",
+                    "visibility_code": "",
+                    "busy": intervals,
+                    "calendars": calendars,
+                    "message": "",
+                },
+                {
+                    "subject": "calendar-1",
+                    "subject_kind": "calendar",
+                    "visibility": "visible",
+                    "visibility_code": "",
+                    "busy": intervals,
+                    "calendars": calendars,
+                    "message": "",
+                },
+            ],
         },
     }
 
@@ -217,7 +260,14 @@ def test_goal_one_invalid_scheduling_preferences_fail_closed(preferences: list[d
 
 def test_goal_one_minimum_notice_is_applied_at_the_next_valid_boundary() -> None:
     result = run_goal_one(
-        goal_one_tools(preferences=[{"default_meeting_duration": 30, "min_notice_hours": 1}]),
+        goal_one_tools(
+            preferences=[{"default_meeting_duration": 30, "min_notice_hours": 1}],
+            free_busy_result=visible_free_busy(
+                [],
+                start=datetime(2026, 9, 22, 8, tzinfo=timezone.utc),
+                end=datetime(2026, 9, 22, 17, tzinfo=timezone.utc),
+            ),
+        ),
         now=datetime(2026, 9, 22, 8, 0, 1, tzinfo=timezone.utc),
         start=datetime(2026, 9, 22, 8, tzinfo=timezone.utc),
     )

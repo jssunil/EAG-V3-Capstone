@@ -230,7 +230,10 @@ def _rule_allows(rule: dict[str, Any], start: datetime, end: datetime) -> bool:
     return False
 
 
-def _busy_intervals(subject: dict[str, Any]) -> list[tuple[datetime, datetime]] | None:
+def _busy_intervals(
+    subject: dict[str, Any],
+    calendar_id: str,
+) -> list[tuple[datetime, datetime]] | None:
     busy = subject.get("busy")
     if not isinstance(busy, list):
         return None
@@ -238,6 +241,11 @@ def _busy_intervals(subject: dict[str, Any]) -> list[tuple[datetime, datetime]] 
     for item in busy:
         if not isinstance(item, dict):
             return None
+        busy_calendar_id = item.get("calendar_id")
+        if not isinstance(busy_calendar_id, str) or not busy_calendar_id.strip():
+            return None
+        if busy_calendar_id != calendar_id:
+            continue
         start = _parse_datetime(item.get("start") or item.get("start_at"))
         end = _parse_datetime(item.get("end") or item.get("end_at"))
         if start is None or end is None or end <= start:
@@ -347,37 +355,70 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
 
     free_busy = tools.free_busy(start=start, end=end, emails=[email], calendar_ids=list(calendar_ids))
     result = free_busy.get("result", {}) if isinstance(free_busy, dict) else {}
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return _clarification(
+            task,
+            "The participant's free/busy response is missing or unsuccessful.",
+            "A successful free/busy result is required before availability can be confirmed.",
+        )
+    window = result.get("window")
+    response_start = _parse_datetime(window.get("start")) if isinstance(window, dict) else None
+    response_end = _parse_datetime(window.get("end")) if isinstance(window, dict) else None
+    if response_start != start or response_end != end:
+        return _clarification(
+            task,
+            "The participant's free/busy response covers a missing or different time window.",
+            "The returned window must match the requested timezone-aware search interval.",
+        )
     subjects = result.get("subjects", []) if isinstance(result, dict) else []
     matching_subjects = [
         subject
         for subject in subjects
-        if isinstance(subject, dict) and subject.get("subject") in {email, *calendar_ids}
+        if (
+            isinstance(subject, dict)
+            and subject.get("subject_kind") == "email"
+            and subject.get("subject") == email
+        )
     ] if isinstance(subjects, list) else []
     if len(matching_subjects) != 1:
         return _clarification(
             task,
             "The participant's free/busy response is missing or ambiguous.",
-            f"Expected one subject matching the resolved participant or calendar; found {len(matching_subjects)}.",
+            f"Expected one email subject matching the resolved participant; found {len(matching_subjects)}.",
         )
     subject = matching_subjects[0]
     subject_calendars = subject.get("calendars")
-    if (
-        not isinstance(subject_calendars, list)
-        or len(subject_calendars) != 1
-        or not isinstance(subject_calendars[0], dict)
-    ):
+    matching_calendars = [
+        calendar
+        for calendar in subject_calendars
+        if isinstance(calendar, dict) and calendar.get("calendar_id") == calendar_id
+    ] if isinstance(subject_calendars, list) else []
+    if len(matching_calendars) != 1:
         return _clarification(
             task,
             "The participant's calendar-sharing evidence is missing or ambiguous.",
-            "Exactly one calendar access record is required for the resolved calendar.",
+            f"Expected one access record for the resolved calendar; found {len(matching_calendars)}.",
         )
-    access = subject_calendars[0].get("access_level")
+    access = matching_calendars[0].get("access_level")
+    actual_access = matching_calendars[0].get("actual_access_level")
     visibility = subject.get("visibility")
     reasons = {str(subject.get("visibility_code", ""))}
-    reasons.update(str(c.get("reason_code", "")) for c in subject_calendars if isinstance(c, dict))
-    if access in (None, "none") or visibility not in {"free_busy", "read", "write"} or reasons & {"freebusy.notShared", "freebusy.noCalendar"}:
+    reasons.update(str(calendar.get("reason_code", "")) for calendar in matching_calendars)
+    if (
+        not isinstance(access, str)
+        or access not in {"free_busy", "read", "write", "owner"}
+        or (
+            "actual_access_level" in matching_calendars[0]
+            and (
+                not isinstance(actual_access, str)
+                or actual_access not in {"free_busy", "read", "write", "owner"}
+            )
+        )
+        or visibility not in {"visible", "free_busy", "read", "write"}
+        or reasons & {"freebusy.notShared", "freebusy.noCalendar"}
+    ):
         return _clarification(task, "The participant's calendar is not shared enough to confirm availability.", "An empty or hidden free/busy result is not confirmed free time.")
-    intervals = _busy_intervals(subject)
+    intervals = _busy_intervals(subject, calendar_id)
     if intervals is None:
         return _clarification(task, "The participant's free/busy response is missing or invalid.", "Availability cannot be confirmed from malformed busy intervals.")
 

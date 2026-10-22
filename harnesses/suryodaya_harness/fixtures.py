@@ -44,12 +44,28 @@ class DeterministicCalendarTools:
             "job_title": "Plant Manager",
         }]
         self.events: list[dict[str, Any]] = []
-        self.free_busy_result = {"result": {"subjects": [{
-            "subject": "plant@example.test",
-            "visibility": "free_busy",
-            "busy": [],
-            "calendars": [{"access_level": "free_busy"}],
-        }]}}
+        self.free_busy_result = {"result": {
+            "ok": True,
+            "window": {
+                "start": "2026-09-22T09:00:00+00:00",
+                "end": "2026-09-22T17:00:00+00:00",
+            },
+            "subjects": [{
+                "subject": "plant@example.test",
+                "subject_kind": "email",
+                "visibility": "visible",
+                "visibility_code": "",
+                "busy": [],
+                "calendars": [{
+                    "calendar_id": "calendar-1",
+                    "calendar_name": "My Calendar",
+                    "access_level": "free_busy",
+                    "actual_access_level": "free_busy",
+                    "access_source": "grant",
+                }],
+                "message": "",
+            }],
+        }}
         self.calendars = [{"id": "calendar-1", "owner_party_id": "plant-1"}]
         self.availability_rules = [{
             "id": "rule-1",

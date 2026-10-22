@@ -75,13 +75,49 @@ def event_page(
 def free_busy_result() -> dict[str, Any]:
     return {
         "structuredContent": {
+            "status": "ok",
             "result": {
-                "subjects": [{
-                    "subject": "plant@example.test",
-                    "visibility": "free_busy",
-                    "busy": [],
-                    "calendars": [{"access_level": "free_busy"}],
-                }]
+                "ok": True,
+                "window": {
+                    "start": "2026-09-22T09:00:00+00:00",
+                    "end": "2026-09-22T17:00:00+00:00",
+                },
+                "subjects": [
+                    {
+                        "subject": "plant@example.test",
+                        "subject_kind": "email",
+                        "visibility": "visible",
+                        "visibility_code": "",
+                        "busy": [],
+                        "calendars": [{
+                            "calendar_id": "calendar-1",
+                            "calendar_name": "My Calendar",
+                            "access_level": "free_busy",
+                            "actual_access_level": "free_busy",
+                            "access_source": "grant",
+                        }],
+                        "message": "",
+                    },
+                    {
+                        "subject": "calendar-1",
+                        "subject_kind": "calendar",
+                        "visibility": "visible",
+                        "visibility_code": "",
+                        "busy": [],
+                        "calendars": [{
+                            "calendar_id": "calendar-1",
+                            "calendar_name": "My Calendar",
+                            "access_level": "free_busy",
+                            "actual_access_level": "free_busy",
+                            "access_source": "grant",
+                        }],
+                        "message": "",
+                    },
+                ],
+                "caller_email": "caller@example.test",
+                "as_level": "free_busy",
+                "disclosure_note_code": "",
+                "disclosure_note": "",
             }
         }
     }

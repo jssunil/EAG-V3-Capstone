@@ -34,6 +34,12 @@ from .server_runner import ServerRunnerError, write_results_atomic
 SURYOODAYA_INSTANCE = "suryodaya"
 GOAL_ONE = "calendar.find_30_minutes"
 GOAL_ONE_TITLE = "Find 30 minutes with the plant head"
+GOAL_TWO = "calendar.move_after_audit"
+GOAL_TWO_TITLE = "Move events after the confirmed press shop and welding audit"
+GOAL_TWO_AUDIT_NUMBER = "EVT-2026-00007"
+GOAL_TWO_AUDIT_TITLE = "Internal quality audit — press shop and welding"
+GOAL_TWO_DEFAULT_SHIFT = timedelta(minutes=30)
+GOAL_TWO_TIMESTAMP_FALLBACK = "Asia/Kolkata"
 _SEARCH_WINDOW = timedelta(days=14)
 
 
@@ -207,6 +213,109 @@ def check_suryodaya_goal_one(
     )
 
 
+def check_suryodaya_goal_two(
+    tools: CalendarTool,
+    *,
+    secret_values: tuple[str, ...] = (),
+) -> HostedCheck:
+    """Verify an exact-reference, read-only move plan that awaits confirmation."""
+
+    task = AgentTask(
+        GOAL_TWO,
+        GOAL_TWO_TITLE,
+        {
+            "audit_number": GOAL_TWO_AUDIT_NUMBER,
+            "audit_title": GOAL_TWO_AUDIT_TITLE,
+            "shift": GOAL_TWO_DEFAULT_SHIFT,
+            "naive_timestamp_timezone": GOAL_TWO_TIMESTAMP_FALLBACK,
+        },
+    )
+    try:
+        result = CalendarAgent(ReadOnlyCalendarTool(tools)).run(task)
+    except (AgentSwitchError, ConfigurationError, MutationDisabledError) as exc:
+        return _task(
+            task_id="suryodaya.goal2_read_only_plan",
+            title="Suryodaya read-only Goal 2 plan",
+            passed=False,
+            evidence=(
+                "UNEVALUATED: Goal 2 read-only planning stopped "
+                f"({type(exc).__name__}); {_read_trace_summary(tools.trace)}."
+            ),
+            secret_values=secret_values,
+        )
+
+    trace = _read_trace_summary(result.tool_calls)
+    if result.status is not ResultStatus.PLANNED:
+        details = " ".join((result.summary, *result.ambiguities))
+        return _task(
+            task_id="suryodaya.goal2_read_only_plan",
+            title="Suryodaya read-only Goal 2 plan",
+            passed=False,
+            evidence=(
+                f"Goal 2 did not produce a plan ({result.status.value}); "
+                f"moves=0; {details}; {trace}."
+            ),
+            secret_values=secret_values,
+        )
+
+    verification = verify_result(result, expected_status=ResultStatus.PLANNED)
+    reference = result.audit_reference
+    exact_reference = (
+        reference is not None
+        and len(reference.candidates) == 1
+        and reference.candidates[0].id == GOAL_TWO_AUDIT_NUMBER
+        and reference.candidates[0].title == GOAL_TWO_AUDIT_TITLE
+        and isinstance(reference.candidates[0].status, str)
+        and reference.candidates[0].status.casefold() == "confirmed"
+        and isinstance(reference.candidates[0].calendar_id, str)
+        and bool(reference.candidates[0].calendar_id.strip())
+    )
+    outcome = result.claimed_outcome
+    confirmation_required = (
+        isinstance(outcome, dict)
+        and outcome.get("confirmation_required") is True
+        and isinstance(outcome.get("confirmation_prompt"), str)
+        and bool(outcome["confirmation_prompt"].strip())
+    )
+    mutation_free = not any(call.mutating for call in result.tool_calls)
+    move_summary = ";".join(
+        f"{move.event_id}:{move.proposed_start_at}>{move.proposed_end_at}"
+        for move in result.rescheduling_plan
+    )
+    evidence = (
+        f"audit={GOAL_TWO_AUDIT_NUMBER};calendar="
+        f"{reference.candidates[0].calendar_id if exact_reference else 'unverified'};"
+        f"moves={len(result.rescheduling_plan)};shift=30m;"
+        f"confirmation_required={str(confirmation_required).lower()};"
+        "confirm_or_change_shift=true;"
+        f"mutation_attempts={sum(call.mutating for call in result.tool_calls)};"
+        f"plan={move_summary}"
+    )
+    passed = (
+        verification.passed
+        and exact_reference
+        and confirmation_required
+        and isinstance(outcome, dict)
+        and outcome.get("moved") is False
+        and outcome.get("shift") == GOAL_TWO_DEFAULT_SHIFT
+        and mutation_free
+        and bool(result.rescheduling_plan)
+    )
+    if len(evidence) > MAX_EVIDENCE_LENGTH:
+        passed = False
+        evidence = (
+            "UNEVALUATED: Goal 2 plan is too large to fit the results evidence "
+            "limit; a complete plan was not serialized."
+        )
+    return _task(
+        task_id="suryodaya.goal2_read_only_plan",
+        title="Suryodaya read-only Goal 2 plan",
+        passed=passed,
+        evidence=evidence,
+        secret_values=secret_values,
+    )
+
+
 def run_hosted(
     environment: Mapping[str, object],
     *,
@@ -231,7 +340,7 @@ def run_hosted(
         )
         summary = (
             "Hosted harness configuration could not be validated; "
-            "business_goal_predicates=unevaluated."
+            "goal_tasks_not_run=true; official_evaluator=not_invoked."
         )
     else:
         if config.instance == SURYOODAYA_INSTANCE:
@@ -242,6 +351,10 @@ def run_hosted(
                     check_suryodaya_goal_one(
                         tools,
                         now=now,
+                        secret_values=secret_values,
+                    ),
+                    check_suryodaya_goal_two(
+                        tools,
                         secret_values=secret_values,
                     ),
                 )
@@ -263,7 +376,7 @@ def run_hosted(
         passed_count = sum(task.passed for task in tasks)
         summary = (
             f"{config.instance}: {passed_count}/{len(tasks)} harness checks passed; "
-            "business_goal_predicates=unevaluated."
+            "official_evaluator=not_invoked."
         )
 
     document = {
@@ -289,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     passed_count = sum(task.passed for task in tasks)
     print(
         f"Hosted harness wrote {output_path}; harness_checks_passed="
-        f"{passed_count}/{len(tasks)}; business_goal_predicates=unevaluated."
+        f"{passed_count}/{len(tasks)}; official_evaluator=not_invoked."
     )
     return 0
 

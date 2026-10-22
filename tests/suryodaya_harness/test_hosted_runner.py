@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -11,6 +11,7 @@ from calendar_agent.models import ToolCallRecord
 from harnesses.suryodaya_harness.hosted_runner import (
     HostedConfigurationError,
     check_suryodaya_goal_one,
+    check_suryodaya_goal_two,
     load_hosted_environment,
     run_hosted,
 )
@@ -47,15 +48,53 @@ def complete_goal_one_tools() -> FakeCalendarTools:
         }],
         free_busy_result={
             "result": {
+                "ok": True,
+                "window": {
+                    "start": NOW.isoformat(),
+                    "end": (NOW + timedelta(days=14)).isoformat(),
+                },
                 "subjects": [{
                     "subject": "plant@example.test",
-                    "visibility": "free_busy",
+                    "subject_kind": "email",
+                    "visibility": "visible",
+                    "visibility_code": "",
                     "busy": [],
-                    "calendars": [{"access_level": "free_busy"}],
+                    "calendars": [{
+                        "calendar_id": "calendar-1",
+                        "calendar_name": "My Calendar",
+                        "access_level": "free_busy",
+                        "actual_access_level": "free_busy",
+                        "access_source": "grant",
+                    }],
+                    "message": "",
                 }],
             },
         },
     )
+
+
+def complete_goal_two_tools() -> FakeCalendarTools:
+    audit = {
+        "id": "audit-uuid",
+        "number": "EVT-2026-00007",
+        "title": "Internal quality audit — press shop and welding",
+        "start_at": "2026-09-19T09:30:00+05:30",
+        "end_at": "2026-09-19T12:30:00+05:30",
+        "timezone": "Asia/Kolkata",
+        "calendar_id": "calendar-1",
+        "status": "confirmed",
+    }
+    after = {
+        "id": "work-uuid",
+        "number": "EVT-2026-00008",
+        "title": "Production review",
+        "start_at": "2026-09-19T13:30:00+05:30",
+        "end_at": "2026-09-19T14:30:00+05:30",
+        "timezone": "Asia/Kolkata",
+        "calendar_id": "calendar-1",
+        "status": "confirmed",
+    }
+    return FakeCalendarTools(events=[audit, after])
 
 
 def test_suryodaya_candidate_is_unevaluated_even_when_structurally_valid() -> None:
@@ -80,6 +119,38 @@ def test_suryodaya_unresolved_party_is_non_passing_and_read_only() -> None:
     assert result.official_record()["passed"] is False
     assert "planner status=needs_clarification" in result.evidence
     assert "mutation_attempts=0" in result.evidence
+    assert all(not call.mutating for call in tools.trace)
+
+
+def test_goal_two_plan_requires_confirmation_and_performs_no_mutation() -> None:
+    tools = complete_goal_two_tools()
+
+    check = check_suryodaya_goal_two(tools)
+
+    assert check.passed
+    assert check.task_id == "suryodaya.goal2_read_only_plan"
+    assert "audit=EVT-2026-00007" in check.evidence
+    assert "calendar=calendar-1" in check.evidence
+    assert "confirmation_required=true" in check.evidence
+    assert "confirm_or_change_shift=true" in check.evidence
+    assert "mutation_attempts=0" in check.evidence
+    assert "work-uuid" in check.evidence
+    assert all(not call.mutating for call in tools.trace)
+
+
+def test_goal_two_uses_explicit_kolkata_fallback_for_naive_times() -> None:
+    tools = complete_goal_two_tools()
+    for event in tools.events:
+        event["start_at"] = str(event["start_at"]).split("+", 1)[0]
+        event["end_at"] = str(event["end_at"]).split("+", 1)[0]
+        event["timezone"] = None
+
+    check = check_suryodaya_goal_two(tools)
+
+    assert check.passed
+    assert "confirmation_required=true" in check.evidence
+    assert "2026-09-19T14:00:00+05:30" in check.evidence
+    assert "mutation_attempts=0" in check.evidence
     assert all(not call.mutating for call in tools.trace)
 
 
@@ -263,7 +334,7 @@ def test_suryodaya_candidate_does_not_serialize_as_predicate_success(
     assert task["passed"] is False
     assert task["score"] == 0.0
     assert task["evidence"].startswith("UNEVALUATED:")
-    assert "business_goal_predicates=unevaluated" in document["summary"]
+    assert "official_evaluator=not_invoked" in document["summary"]
 
 
 def test_hosted_toml_selects_suryodaya_only() -> None:
@@ -302,7 +373,18 @@ def test_run_hosted_dispatches_suryodaya_check_and_writes_contract_results(
 
     document = parse_results(output_path.read_text(encoding="utf-8"))
     assert output_path == results_path
+    assert [check.task_id for check in checks] == [
+        "suryodaya.goal1_read_only_candidate",
+        "suryodaya.goal2_read_only_plan",
+    ]
+    assert [task["id"] for task in document["tasks"]] == [
+        "suryodaya.goal1_read_only_candidate",
+        "suryodaya.goal2_read_only_plan",
+    ]
     assert not checks[0].passed
     assert document["tasks"][0]["passed"] is False
     assert document["tasks"][0]["evidence"].startswith("UNEVALUATED:")
+    assert not checks[1].passed
+    assert "Goal 2 did not produce a plan" in document["tasks"][1]["evidence"]
+    assert "official_evaluator=not_invoked" in document["summary"]
     assert "secret-token" not in results_path.read_text(encoding="utf-8")

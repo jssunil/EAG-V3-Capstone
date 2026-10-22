@@ -1,6 +1,8 @@
 from copy import deepcopy
 from datetime import datetime, timezone
 
+import pytest
+
 from calendar_agent.agent import CalendarAgent
 from calendar_agent.models import AgentTask, PartyPage, PartyRecord, ResultStatus, ToolCallRecord
 from harnesses.suryodaya_harness.assertions import verify_result, verify_supported_slot
@@ -137,13 +139,46 @@ def _tools_for_party(
     )
 
 
-def _visible_free_busy(busy: list[dict[str, str]]) -> dict[str, object]:
-    return {"result": {"subjects": [{
-        "subject": "plant@example.test",
-        "visibility": "free_busy",
-        "busy": busy,
-        "calendars": [{"access_level": "free_busy"}],
-    }]}}
+def _visible_free_busy(
+    busy: list[dict[str, str]],
+    *,
+    start: datetime = datetime(2026, 9, 22, 9, tzinfo=timezone.utc),
+    end: datetime = datetime(2026, 9, 22, 17, tzinfo=timezone.utc),
+) -> dict[str, object]:
+    intervals = [
+        {
+            **item,
+            "calendar_id": item.get("calendar_id", "calendar-1"),
+            "start_at": item.get("start_at", item.get("start", "")),
+            "end_at": item.get("end_at", item.get("end", "")),
+            "all_day": False,
+            "transparency": "busy",
+            "detail_level": "free_busy",
+        }
+        for item in busy
+    ]
+    return {"result": {
+        "ok": True,
+        "window": {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+        },
+        "subjects": [{
+            "subject": "plant@example.test",
+            "subject_kind": "email",
+            "visibility": "visible",
+            "visibility_code": "",
+            "busy": intervals,
+            "calendars": [{
+                "calendar_id": "calendar-1",
+                "calendar_name": "My Calendar",
+                "access_level": "free_busy",
+                "actual_access_level": "free_busy",
+                "access_source": "grant",
+            }],
+            "message": "",
+        }],
+    }}
 
 
 def test_unique_plant_head_with_verified_free_slot_is_planned() -> None:
@@ -199,7 +234,10 @@ def test_negative_minimum_notice_fails_closed_without_candidate_slots() -> None:
 
 def test_positive_minimum_notice_preserves_existing_behavior() -> None:
     result = CalendarAgent(_tools_for_party(
-        free_busy_result=_visible_free_busy([]),
+        free_busy_result=_visible_free_busy(
+            [],
+            start=datetime(2026, 9, 22, 8, tzinfo=timezone.utc),
+        ),
         min_notice_hours=1,
     )).run(
         AgentTask(
@@ -370,7 +408,10 @@ def test_minimum_notice_with_seconds_rounds_up_without_crossing_boundary() -> No
         "end": datetime(2026, 9, 22, 17, tzinfo=timezone.utc),
     }
     tools = _tools_for_party(
-        free_busy_result=_visible_free_busy([]),
+        free_busy_result=_visible_free_busy(
+            [],
+            start=datetime(2026, 9, 22, 8, tzinfo=timezone.utc),
+        ),
         min_notice_hours=1,
     )
 
@@ -408,13 +449,28 @@ def test_multiple_owned_calendars_require_clarification() -> None:
 
 
 def test_not_shared_free_busy_is_not_confirmed_free() -> None:
-    tools = _tools_for_party(free_busy_result={"result": {"subjects": [{
-        "subject": "plant@example.test",
-        "visibility": "unknown",
-        "visibility_code": "freebusy.notShared",
-        "busy": [],
-        "calendars": [{"access_level": "none", "reason_code": "freebusy.notShared"}],
-    }]}})
+    tools = _tools_for_party(free_busy_result={"result": {
+        "ok": True,
+        "window": {
+            "start": "2026-09-22T09:00:00+00:00",
+            "end": "2026-09-22T17:00:00+00:00",
+        },
+        "subjects": [{
+            "subject": "plant@example.test",
+            "subject_kind": "email",
+            "visibility": "unknown",
+            "visibility_code": "freebusy.notShared",
+            "busy": [],
+            "calendars": [{
+                "calendar_id": "calendar-1",
+                "calendar_name": "My Calendar",
+                "access_level": "none",
+                "actual_access_level": "none",
+                "access_source": "none",
+            }],
+            "message": "not shared",
+        }],
+    }})
 
     result = CalendarAgent(tools).run(
         AgentTask("calendar.find_30_minutes", "Find 30 minutes with the plant head", _valid_context())
@@ -424,6 +480,31 @@ def test_not_shared_free_busy_is_not_confirmed_free() -> None:
     assert not result.candidate_slots
     assert "not confirmed" in " ".join(result.ambiguities)
     assert not any(call.mutating for call in result.tool_calls)
+
+
+@pytest.mark.parametrize(
+    "window",
+    [
+        None,
+        {"start": "2026-09-22T09:00:00+00:00", "end": "2026-09-22T16:00:00+00:00"},
+    ],
+)
+def test_missing_or_mismatched_free_busy_window_requires_clarification(
+    window: dict[str, str] | None,
+) -> None:
+    response = _visible_free_busy([])
+    if window is None:
+        response["result"].pop("window")
+    else:
+        response["result"]["window"] = window
+
+    result = CalendarAgent(_tools_for_party(free_busy_result=response)).run(
+        AgentTask("calendar.find_30_minutes", "Find 30 minutes with the plant head", _valid_context())
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.candidate_slots
+    assert "time window" in result.summary
 
 
 def test_ambiguous_free_busy_subjects_require_clarification() -> None:
@@ -444,7 +525,10 @@ def test_ambiguous_free_busy_subjects_require_clarification() -> None:
 
 def test_ambiguous_free_busy_calendar_access_requires_clarification() -> None:
     response = _visible_free_busy([])
-    response["result"]["subjects"][0]["calendars"].append({"access_level": "none"})
+    response["result"]["subjects"][0]["calendars"].append({
+        **response["result"]["subjects"][0]["calendars"][0],
+        "access_level": "none",
+    })
 
     result = CalendarAgent(_tools_for_party(free_busy_result=response)).run(
         AgentTask("calendar.find_30_minutes", "Find 30 minutes with the plant head", _valid_context())
@@ -453,6 +537,86 @@ def test_ambiguous_free_busy_calendar_access_requires_clarification() -> None:
     assert result.status is ResultStatus.NEEDS_CLARIFICATION
     assert not result.candidate_slots
     assert "ambiguous" in result.summary
+
+
+def test_conflicting_actual_calendar_access_requires_clarification() -> None:
+    response = _visible_free_busy([])
+    response["result"]["subjects"][0]["calendars"][0]["actual_access_level"] = "none"
+
+    result = CalendarAgent(_tools_for_party(free_busy_result=response)).run(
+        AgentTask("calendar.find_30_minutes", "Find 30 minutes with the plant head", _valid_context())
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.candidate_slots
+    assert "not shared enough" in result.summary
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("access_level", ["free_busy"]),
+        ("access_level", {"level": "free_busy"}),
+        ("actual_access_level", ["free_busy"]),
+        ("actual_access_level", {"level": "free_busy"}),
+        ("access_level", "unknown"),
+        ("actual_access_level", "unknown"),
+    ],
+)
+def test_malformed_or_unknown_calendar_access_requires_clarification(
+    field: str,
+    value: object,
+) -> None:
+    response = _visible_free_busy([])
+    response["result"]["subjects"][0]["calendars"][0][field] = value
+
+    result = CalendarAgent(_tools_for_party(free_busy_result=response)).run(
+        AgentTask("calendar.find_30_minutes", "Find 30 minutes with the plant head", _valid_context())
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.candidate_slots
+
+
+def test_missing_actual_calendar_access_preserves_existing_planning_behavior() -> None:
+    response = _visible_free_busy([])
+    response["result"]["subjects"][0]["calendars"][0].pop("actual_access_level")
+
+    result = CalendarAgent(_tools_for_party(free_busy_result=response)).run(
+        AgentTask("calendar.find_30_minutes", "Find 30 minutes with the plant head", _valid_context())
+    )
+
+    assert result.status is ResultStatus.PLANNED
+    assert len(result.candidate_slots) == 1
+
+
+def test_calendar_alias_subject_does_not_make_email_subject_ambiguous() -> None:
+    response = _visible_free_busy([])
+    response["result"]["subjects"].append({
+        **response["result"]["subjects"][0],
+        "subject": "calendar-1",
+        "subject_kind": "calendar",
+    })
+
+    result = CalendarAgent(_tools_for_party(free_busy_result=response)).run(
+        AgentTask("calendar.find_30_minutes", "Find 30 minutes with the plant head", _valid_context())
+    )
+
+    assert result.status is ResultStatus.PLANNED
+    assert len(result.candidate_slots) == 1
+
+
+def test_busy_interval_from_another_calendar_does_not_block_the_selected_calendar() -> None:
+    result = CalendarAgent(_tools_for_party(free_busy_result=_visible_free_busy([{
+        "calendar_id": "another-calendar",
+        "start": "2026-09-22T09:00:00+00:00",
+        "end": "2026-09-22T17:00:00+00:00",
+    }]))).run(
+        AgentTask("calendar.find_30_minutes", "Find 30 minutes with the plant head", _valid_context())
+    )
+
+    assert result.status is ResultStatus.PLANNED
+    assert len(result.candidate_slots) == 1
 
 
 def test_no_plant_head_is_clarification() -> None:

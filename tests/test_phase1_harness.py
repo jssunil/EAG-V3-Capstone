@@ -252,12 +252,28 @@ def test_goal_one_planner_surfaces_duration_mismatch() -> None:
             "weekly_hours": [{"day": "tuesday", "start": "09:00", "end": "17:00", "enabled": True}],
         }],
         scheduling_preferences=[{"default_meeting_duration": 30, "min_notice_hours": 0}],
-        free_busy_result={"result": {"subjects": [{
-            "subject": "plant@example.test",
-            "visibility": "free_busy",
-            "busy": [],
-            "calendars": [{"access_level": "free_busy"}],
-        }]}},
+        free_busy_result={"result": {
+            "ok": True,
+            "window": {
+                "start": "2026-09-22T09:00:00+00:00",
+                "end": "2026-09-22T17:00:00+00:00",
+            },
+            "subjects": [{
+                "subject": "plant@example.test",
+                "subject_kind": "email",
+                "visibility": "visible",
+                "visibility_code": "",
+                "busy": [],
+                "calendars": [{
+                    "calendar_id": "calendar-1",
+                    "calendar_name": "My Calendar",
+                    "access_level": "free_busy",
+                    "actual_access_level": "free_busy",
+                    "access_source": "grant",
+                }],
+                "message": "",
+            }],
+        }},
     )
     result = CalendarAgent(tools).run(AgentTask(
         "calendar.find_30_minutes",
