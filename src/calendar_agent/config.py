@@ -6,9 +6,6 @@ import os
 from dataclasses import dataclass
 
 
-DEFAULT_BASE_URL = "https://agentswitch.theschoolofai.in"
-
-
 class ConfigurationError(ValueError):
     """Raised when the local AgentSwitch configuration is incomplete."""
 
@@ -17,7 +14,7 @@ class ConfigurationError(ValueError):
 class AgentSwitchConfig:
     """Non-secret connection settings and bearer-token authentication."""
 
-    base_url: str = DEFAULT_BASE_URL
+    base_url: str
     token: str | None = None
     timeout_seconds: float = 10.0
 
@@ -26,6 +23,11 @@ class AgentSwitchConfig:
         """Build configuration from environment variables without reading files."""
 
         token = os.getenv("AGENTSWITCH_TOKEN")
+        base_url = os.getenv("AGENTSWITCH_BASE_URL")
+        if base_url is None or not base_url.strip():
+            raise ConfigurationError(
+                "Set AGENTSWITCH_BASE_URL for the AgentSwitch instance"
+            )
         try:
             timeout_seconds = float(os.getenv("AGENTSWITCH_TIMEOUT_SECONDS", "10"))
         except ValueError as exc:
@@ -34,7 +36,7 @@ class AgentSwitchConfig:
             ) from exc
 
         config = cls(
-            base_url=os.getenv("AGENTSWITCH_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
+            base_url=base_url.strip().rstrip("/"),
             token=token,
             timeout_seconds=timeout_seconds,
         )
@@ -44,7 +46,7 @@ class AgentSwitchConfig:
     def validate(self) -> None:
         """Validate settings needed to make an authenticated request."""
 
-        if not self.base_url:
+        if not isinstance(self.base_url, str) or not self.base_url.strip():
             raise ConfigurationError("AGENTSWITCH_BASE_URL cannot be empty")
         if not self.token:
             raise ConfigurationError("Set AGENTSWITCH_TOKEN for authenticated access")

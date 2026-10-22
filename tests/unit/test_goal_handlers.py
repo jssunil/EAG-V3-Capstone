@@ -426,6 +426,35 @@ def test_not_shared_free_busy_is_not_confirmed_free() -> None:
     assert not any(call.mutating for call in result.tool_calls)
 
 
+def test_ambiguous_free_busy_subjects_require_clarification() -> None:
+    response = _visible_free_busy([])
+    response["result"]["subjects"].append({
+        **response["result"]["subjects"][0],
+        "visibility": "unknown",
+    })
+
+    result = CalendarAgent(_tools_for_party(free_busy_result=response)).run(
+        AgentTask("calendar.find_30_minutes", "Find 30 minutes with the plant head", _valid_context())
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.candidate_slots
+    assert "ambiguous" in result.summary
+
+
+def test_ambiguous_free_busy_calendar_access_requires_clarification() -> None:
+    response = _visible_free_busy([])
+    response["result"]["subjects"][0]["calendars"].append({"access_level": "none"})
+
+    result = CalendarAgent(_tools_for_party(free_busy_result=response)).run(
+        AgentTask("calendar.find_30_minutes", "Find 30 minutes with the plant head", _valid_context())
+    )
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.candidate_slots
+    assert "ambiguous" in result.summary
+
+
 def test_no_plant_head_is_clarification() -> None:
     tools = _tools_for_party(parties=[], free_busy_result=_visible_free_busy([]))
 

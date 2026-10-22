@@ -348,11 +348,32 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
     free_busy = tools.free_busy(start=start, end=end, emails=[email], calendar_ids=list(calendar_ids))
     result = free_busy.get("result", {}) if isinstance(free_busy, dict) else {}
     subjects = result.get("subjects", []) if isinstance(result, dict) else []
-    subject = next((s for s in subjects if isinstance(s, dict) and s.get("subject") in {email, *calendar_ids}), {}) if isinstance(subjects, list) else {}
-    subject_calendars = subject.get("calendars", []) if isinstance(subject, dict) else []
-    access = subject_calendars[0].get("access_level") if subject_calendars and isinstance(subject_calendars[0], dict) else None
-    visibility = subject.get("visibility") if isinstance(subject, dict) else None
-    reasons = {str(subject.get("visibility_code", ""))} if isinstance(subject, dict) else set()
+    matching_subjects = [
+        subject
+        for subject in subjects
+        if isinstance(subject, dict) and subject.get("subject") in {email, *calendar_ids}
+    ] if isinstance(subjects, list) else []
+    if len(matching_subjects) != 1:
+        return _clarification(
+            task,
+            "The participant's free/busy response is missing or ambiguous.",
+            f"Expected one subject matching the resolved participant or calendar; found {len(matching_subjects)}.",
+        )
+    subject = matching_subjects[0]
+    subject_calendars = subject.get("calendars")
+    if (
+        not isinstance(subject_calendars, list)
+        or len(subject_calendars) != 1
+        or not isinstance(subject_calendars[0], dict)
+    ):
+        return _clarification(
+            task,
+            "The participant's calendar-sharing evidence is missing or ambiguous.",
+            "Exactly one calendar access record is required for the resolved calendar.",
+        )
+    access = subject_calendars[0].get("access_level")
+    visibility = subject.get("visibility")
+    reasons = {str(subject.get("visibility_code", ""))}
     reasons.update(str(c.get("reason_code", "")) for c in subject_calendars if isinstance(c, dict))
     if access in (None, "none") or visibility not in {"free_busy", "read", "write"} or reasons & {"freebusy.notShared", "freebusy.noCalendar"}:
         return _clarification(task, "The participant's calendar is not shared enough to confirm availability.", "An empty or hidden free/busy result is not confirmed free time.")
