@@ -179,7 +179,11 @@ def map_calendar_record(
         errors=errors,
     )
     timezone = _text_field(
-        record, "timezone", required=False, unresolved=unresolved, errors=errors
+        record,
+        "timezone",
+        required=False,
+        unresolved=unresolved,
+        errors=errors,
     )
     value = None
     if source_id is not None and not errors:
@@ -223,9 +227,11 @@ def map_calendar_event_record(
     status = _text_field(
         record, "status", required=False, unresolved=unresolved, errors=errors
     )
-    timezone = _text_field(
-        record, "timezone", required=False, unresolved=unresolved, errors=errors
-    )
+    timezone = None
+    if record.get("timezone") is not None:
+        timezone = _text_field(
+            record, "timezone", required=True, unresolved=unresolved, errors=errors
+        )
     value = None
     if (
         source_id is not None
@@ -421,9 +427,7 @@ class KeystoneCalendarAdapter:
             requests.append(request)
             try:
                 if self._synthetic_response_pages is None:
-                    self._client.call_authorized_read(authorization)
-                    read_error = "McpResponseEnvelopeUnverified"
-                    break
+                    response = self._client.call_authorized_read(authorization)
                 else:
                     response_key = (tool_name, request.arguments["offset"])
                     if response_key not in self._synthetic_response_pages:
@@ -439,7 +443,11 @@ class KeystoneCalendarAdapter:
                 validate_json_schema_instance(
                     self._client.validate_read_authorization(authorization).output_schema,
                     response,
-                    location="synthetic structured resource response",
+                    location=(
+                        "hosted structured resource response"
+                        if self._synthetic_response_pages is None
+                        else "synthetic structured resource response"
+                    ),
                 )
             except KeystoneProtocolError as exc:
                 raise _KeystonePageSchemaValidationError(

@@ -17,12 +17,19 @@ from harnesses.keystone_harness import (
     KeystoneTransportError,
     run_keystone_goal,
 )
+from harnesses.suryodaya_harness.hosted_runner import (
+    check_keystone_goal_one,
+    check_keystone_goal_two,
+)
 from harnesses.keystone_harness.goal_integration import KeystoneCalendarTool
 
 
 _RESOURCE_FILTERS: dict[str, dict[str, dict[str, Any]]] = {
     "Party.list": {"job_title": {"type": "string"}},
-    "Calendar.list": {"owner_party_id": {"type": "string"}},
+    "Calendar.list": {
+        "id": {"type": "string"},
+        "owner_party_id": {"type": "string"},
+    },
     "CalendarEvent.list": {
         "search": {"type": "string"},
         "calendar_id": {"type": "string"},
@@ -425,6 +432,153 @@ def test_move_goal_plans_complete_synthetic_events_without_mutation() -> None:
     assert session.methods == ["tools/list"]
 
 
+def test_hosted_keystone_goal_one_stays_unevaluated_without_required_capabilities() -> None:
+    adapter, _ = _adapter({
+        ("Party.list", 0): _page([_party("party-1")], total=1),
+        ("Calendar.list", 0): _page([_calendar()], total=1),
+    })
+
+    check = check_keystone_goal_one(adapter, now=_BASE_TIME)
+
+    assert not check.passed
+    assert check.evidence.startswith("UNEVALUATED:")
+    assert "availability rules" in check.evidence
+    assert "mutation_attempts=0" in check.evidence
+
+
+def test_hosted_keystone_goal_two_requires_confirmation_and_never_mutates() -> None:
+    events = [
+        _event(
+            "audit-1",
+            "Internal quality audit",
+            "2026-09-22T09:00:00+00:00",
+            "2026-09-22T10:00:00+00:00",
+        ),
+        _event(
+            "after-1",
+            "Production review",
+            "2026-09-22T11:00:00+00:00",
+            "2026-09-22T12:00:00+00:00",
+        ),
+    ]
+    adapter, _ = _adapter({
+        ("CalendarEvent.list", 0): _page(events, total=2),
+    })
+
+    check = check_keystone_goal_two(adapter)
+
+    assert check.passed
+    assert "calendar_resolved=true" in check.evidence
+    assert "confirmation_required=true" in check.evidence
+    assert "mutation_attempts=0" in check.evidence
+
+
+def test_hosted_keystone_goal_two_refuses_ambiguous_audits() -> None:
+    events = [
+        _event(
+            "audit-1",
+            "Internal quality audit",
+            "2026-09-22T09:00:00+00:00",
+            "2026-09-22T10:00:00+00:00",
+        ),
+        _event(
+            "audit-2",
+            "Supplier audit",
+            "2026-09-22T13:00:00+00:00",
+            "2026-09-22T14:00:00+00:00",
+        ),
+    ]
+    adapter, _ = _adapter({
+        ("CalendarEvent.list", 0): _page(events, total=2),
+    })
+
+    check = check_keystone_goal_two(adapter)
+
+    assert not check.passed
+    assert "did not resolve exactly one candidate" in check.evidence
+
+
+def test_hosted_keystone_goal_two_requires_confirmed_audit() -> None:
+    audit = _event(
+        "audit-1",
+        "Internal quality audit",
+        "2026-09-22T09:00:00+00:00",
+        "2026-09-22T10:00:00+00:00",
+    )
+    audit["status"] = "tentative"
+    adapter, _ = _adapter({
+        ("CalendarEvent.list", 0): _page([audit], total=1),
+    })
+
+    check = check_keystone_goal_two(adapter)
+
+    assert not check.passed
+    assert "not verified as confirmed" in check.evidence
+
+
+def test_move_goal_uses_the_matching_calendars_timezone_for_naive_timestamps() -> None:
+    audit = {
+        **_AUDIT,
+        "start_at": "2026-09-22T09:00:00",
+        "end_at": "2026-09-22T10:00:00",
+        "timezone": None,
+    }
+    after = {
+        **_event(
+            "after-1",
+            "Work",
+            "2026-09-22T11:00:00",
+            "2026-09-22T12:00:00",
+        ),
+        "timezone": None,
+    }
+    adapter, _ = _adapter({
+        ("CalendarEvent.list", 0): _page([audit, after], total=2),
+        ("Calendar.list", 0): _page(
+            [_calendar(timezone_name="America/Los_Angeles")],
+            total=1,
+        ),
+    })
+
+    result = _run_move(adapter)
+
+    assert result.status is ResultStatus.PLANNED
+    move = result.rescheduling_plan[0]
+    assert move.original_start_at == "2026-09-22T11:00:00-07:00"
+    assert move.proposed_start_at == "2026-09-22T12:00:00-07:00"
+    assert move.timezone == "America/Los_Angeles"
+    assert move.duration_seconds == 3600
+    assert result.audit_reference is not None
+    assert result.audit_reference.candidates[0].start_at == "2026-09-22T09:00:00-07:00"
+    assert [call.tool for call in result.tool_calls].count("Calendar.list") == 1
+    assert not any(call.mutating for call in result.tool_calls)
+
+
+@pytest.mark.parametrize(
+    ("calendar", "expected_category"),
+    [
+        (_calendar() | {"timezone": None}, "incomplete_data"),
+        (_calendar() | {"timezone": "Mars/Phobos"}, "record_mapping_failure"),
+    ],
+)
+def test_move_goal_missing_or_invalid_calendar_fallback_timezone_fails_closed(
+    calendar: dict[str, str | None],
+    expected_category: str,
+) -> None:
+    audit = {**_AUDIT, "timezone": None}
+    after = {**_event("after-1", "Work", "2026-09-22T11:00:00", "2026-09-22T12:00:00"), "timezone": None}
+    adapter, _ = _adapter({
+        ("CalendarEvent.list", 0): _page([audit, after], total=2),
+        ("Calendar.list", 0): _page([calendar], total=1),
+    })
+
+    result = _run_move(adapter)
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert any(expected_category in item for item in result.ambiguities)
+
+
 def test_move_goal_missing_or_ambiguous_audit_requires_clarification() -> None:
     no_audit_adapter, _ = _adapter({
         ("CalendarEvent.list", 0): _page(
@@ -474,7 +628,6 @@ def test_move_goal_missing_required_event_fields_is_not_dropped() -> None:
     ("start", "end", "zone"),
     [
         ("not-a-date", "2026-09-22T12:00:00+00:00", "UTC"),
-        ("2026-09-22T11:00:00", "2026-09-22T12:00:00", "UTC"),
         (
             "2026-09-22T11:00:00+00:00",
             "2026-09-22T12:00:00+00:00",
@@ -499,6 +652,25 @@ def test_move_goal_malformed_naive_or_invalid_timezone_fails_closed(
 
     assert result.status is ResultStatus.NEEDS_CLARIFICATION
     assert not result.rescheduling_plan
+
+
+def test_move_goal_naive_timestamps_use_valid_event_timezone() -> None:
+    audit = {
+        **_AUDIT,
+        "start_at": "2026-09-22T09:00:00",
+        "end_at": "2026-09-22T10:00:00",
+    }
+    after = _event("after-1", "Work", "2026-09-22T11:00:00", "2026-09-22T12:00:00")
+    adapter, _ = _adapter({
+        ("CalendarEvent.list", 0): _page([audit, after], total=2),
+    })
+
+    result = _run_move(adapter)
+
+    assert result.status is ResultStatus.PLANNED
+    assert result.rescheduling_plan[0].original_start_at == "2026-09-22T11:00:00+00:00"
+    assert result.rescheduling_plan[0].duration_seconds == 3600
+    assert not any(call.mutating for call in result.tool_calls)
 
 
 def test_move_goal_duplicate_ids_across_audit_boundary_fails_closed() -> None:
@@ -688,7 +860,7 @@ def test_move_goal_inconsistent_audit_search_and_full_listing_requires_clarifica
     assert "interval changed between reads" in result.summary
 
 
-def test_move_goal_missing_event_timezone_fails_closed() -> None:
+def test_move_goal_missing_event_and_calendar_timezone_fails_closed() -> None:
     event_without_timezone = _event(
         "work-1",
         "Work",
@@ -708,7 +880,7 @@ def test_move_goal_missing_event_timezone_fails_closed() -> None:
     assert result.status is ResultStatus.NEEDS_CLARIFICATION
     assert not result.rescheduling_plan
     assert any("incomplete_data" in item for item in result.ambiguities)
-    assert any("timezone" in item for item in result.ambiguities)
+    assert any("Calendar.list" in item for item in result.ambiguities)
 
 
 def test_move_goal_nonpositive_event_interval_fails_closed() -> None:

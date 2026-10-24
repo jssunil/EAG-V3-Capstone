@@ -33,8 +33,6 @@ from .mcp_response import (
 _STANDARD_SESSION_PREPARE_REQUEST = requests.Session.prepare_request
 _STANDARD_SESSION_GET_ADAPTER = requests.Session.get_adapter
 _STANDARD_HTTP_ADAPTER_SEND = HTTPAdapter.send
-# Tests replace this private seam with an in-memory adapter response.
-_HTTP_ADAPTER_SEND = _STANDARD_HTTP_ADAPTER_SEND
 
 _RETRY_PARAMETERS = inspect.signature(Retry).parameters
 _REQUIRED_RETRY_FIELDS = ("total", "connect", "read", "redirect", "status")
@@ -51,9 +49,9 @@ class CalendarListPilotTransport:
         config = client.config
         if type(config) is not KeystoneConfig:
             raise TypeError("client config must be the concrete KeystoneConfig")
-        if not config.endpoint.startswith("https://"):
+        if not config.is_approved_pilot_origin:
             raise KeystoneOperationNotAllowedError(
-                "Calendar.list pilot transport requires HTTPS."
+                "Calendar.list pilot transport requires the approved Keystone origin."
             )
 
         self._client = ref(client)
@@ -112,7 +110,9 @@ class CalendarListPilotTransport:
             or set(session.adapters) != {"https://"}
             or type(adapter) is not HTTPAdapter
             or session.adapters.get("https://") is not adapter
-            or not self._endpoint.startswith("https://")
+            or not self._config.is_approved_pilot_origin
+            or self._endpoint != self._config.endpoint
+            or self._endpoint != f"{self._config.base_url}/api/mcp"
             or requests.Session.prepare_request is not _STANDARD_SESSION_PREPARE_REQUEST
             or requests.Session.get_adapter is not _STANDARD_SESSION_GET_ADAPTER
             or HTTPAdapter.send is not _STANDARD_HTTP_ADAPTER_SEND
@@ -217,7 +217,7 @@ class CalendarListPilotTransport:
         response: Any = None
         try:
             # HTTPAdapter.send passes redirect=False and the zero-retry policy to urllib3.
-            response = _HTTP_ADAPTER_SEND(
+            response = _STANDARD_HTTP_ADAPTER_SEND(
                 self._adapter,
                 prepared,
                 stream=False,

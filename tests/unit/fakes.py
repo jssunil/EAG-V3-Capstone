@@ -48,7 +48,10 @@ class FakeCalendarTools:
 
     def get_calendar(self, calendar_id: str) -> dict[str, Any]:
         self._record("Calendar.get", {"id": calendar_id})
-        return {}
+        return next(
+            (calendar for calendar in self.calendars if calendar.get("id") == calendar_id),
+            {},
+        )
 
     def list_events(self, **filters: Any) -> list[dict[str, Any]]:
         self._record("CalendarEvent.list", filters)

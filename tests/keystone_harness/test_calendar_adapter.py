@@ -28,6 +28,7 @@ _LIST_FILTERS = {
         "email": {"type": "string", "format": "email"},
     },
     "Calendar.list": {
+        "id": {"type": "string", "minLength": 1},
         "owner_party_id": {"type": "string"},
         "timezone": {"type": "string"},
     },
@@ -153,6 +154,18 @@ class SyntheticDiscoverySession:
     def post(self, url: str, **kwargs: Any) -> SyntheticDiscoveryResponse:
         request = kwargs["json"]
         self.methods.append(request["method"])
+        if request["method"] == "initialize":
+            return SyntheticDiscoveryResponse({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "serverInfo": {"name": "test-server", "version": "1"},
+                },
+            })
+        if request["method"] == "notifications/initialized":
+            return SyntheticDiscoveryResponse({})
         if request["method"] != "tools/list":
             raise AssertionError("synthetic discovery session cannot call tools")
         return SyntheticDiscoveryResponse({
@@ -175,6 +188,39 @@ class SyntheticDiscoverySession:
         })
 
 
+class HostedReadSession(SyntheticDiscoverySession):
+    def __init__(
+        self,
+        descriptors: tuple[DiscoveredTool, ...],
+        pages: Mapping[tuple[str, int], Mapping[str, Any]],
+    ) -> None:
+        super().__init__(descriptors)
+        self.pages = pages
+
+    def post(self, url: str, **kwargs: Any) -> SyntheticDiscoveryResponse:
+        request = kwargs["json"]
+        if request["method"] in {
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+        }:
+            return super().post(url, **kwargs)
+        if request["method"] != "tools/call":
+            raise AssertionError("hosted read fixture received an unexpected method")
+        self.methods.append(request["method"])
+        name = request["params"]["name"]
+        offset = request["params"]["arguments"]["offset"]
+        page = self.pages[(name, offset)]
+        return SyntheticDiscoveryResponse({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "content": [],
+                "structuredContent": page,
+            },
+        })
+
+
 def _build_adapter(
     fixture: SyntheticReadClient,
     *,
@@ -192,6 +238,50 @@ def _build_adapter(
         synthetic_response_pages=fixture.pages,
     )
     return adapter, session
+
+
+def test_opted_in_hosted_adapter_uses_only_validated_read_pages() -> None:
+    catalog = _catalog()
+    session = HostedReadSession(
+        catalog.tools,
+        {
+            ("Calendar.list", 0): _page(
+                [
+                    {
+                        "id": "calendar-1",
+                        "owner_party_id": "party-1",
+                        "timezone": "UTC",
+                    }
+                ],
+                total=1,
+                limit=2,
+                offset=0,
+            )
+        },
+    )
+    client = KeystoneClient(
+        KeystoneConfig.for_hosted_runner(
+            base_url="http://runner.internal:8000/keystone",
+            token="offline-hosted-test-token",
+        ),
+        session=session,  # type: ignore[arg-type]
+        enable_hosted_read_transport=True,
+    )
+    client.list_tools()
+    adapter = KeystoneCalendarAdapter(client)
+
+    result = adapter.list_calendars(filters={"owner_party_id": "party-1"}, limit=2)
+
+    assert result.collection_complete
+    assert result.records is not None
+    assert result.records[0].value is not None
+    assert result.records[0].value.id == "calendar-1"
+    assert session.methods == [
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "tools/call",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -499,7 +589,7 @@ def test_party_mapping_does_not_invent_missing_name_email_or_job_title() -> None
     }
 
 
-def test_calendar_event_timezone_remains_unresolved_when_absent() -> None:
+def test_calendar_event_timezone_is_optional_for_explicit_fallback_resolution() -> None:
     fixture = SyntheticReadClient({
         ("CalendarEvent.list", 0): _page(
             [{
@@ -523,8 +613,8 @@ def test_calendar_event_timezone_remains_unresolved_when_absent() -> None:
     mapping = result.records[0]
     assert mapping.value is not None
     assert mapping.value.timezone is None
-    assert "timezone" in mapping.unresolved_fields
-    assert not result.is_complete
+    assert "timezone" not in mapping.unresolved_fields
+    assert result.is_complete
 
 
 def test_malformed_event_fields_are_reported_without_a_fabricated_model() -> None:

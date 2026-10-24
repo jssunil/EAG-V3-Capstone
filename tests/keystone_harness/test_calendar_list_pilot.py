@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+from io import BytesIO
 import json
 import threading
 from collections.abc import Callable
@@ -11,6 +12,9 @@ from typing import Any
 
 import pytest
 import requests
+from urllib3.connectionpool import HTTPSConnectionPool
+from urllib3.exceptions import ReadTimeoutError
+from urllib3.response import HTTPResponse
 from requests.adapters import HTTPAdapter, Retry
 
 from harnesses.keystone_harness import calendar_list_transport as transport_module
@@ -195,24 +199,49 @@ class _ToolsListOnlySession:
         return http_response
 
 
-_ADAPTER_SPIES: dict[int, _ToolsListOnlySession] = {}
+_POOL_SPIES: dict[tuple[str, int | None], tuple[HTTPAdapter, _ToolsListOnlySession]] = {}
 
 
 @pytest.fixture(autouse=True)
-def _use_synthetic_adapter_send(monkeypatch: pytest.MonkeyPatch):
-    def synthetic_adapter_send(
-        adapter: HTTPAdapter,
-        prepared_request: requests.PreparedRequest,
+def _use_synthetic_https_pool(monkeypatch: pytest.MonkeyPatch):
+    def synthetic_urlopen(
+        pool: HTTPSConnectionPool,
+        method: str,
+        url: str,
+        body: bytes | None = None,
+        headers: Any = None,
         **kwargs: Any,
-    ) -> requests.Response:
-        spy = _ADAPTER_SPIES.get(id(adapter))
-        if spy is None:
-            raise AssertionError("unexpected adapter dispatch")
-        return spy.send_pilot(adapter, prepared_request, **kwargs)
+    ) -> HTTPResponse:
+        binding = _POOL_SPIES.get((pool.host, pool.port))
+        if binding is None:
+            raise AssertionError("unexpected HTTPS pool dispatch")
+        adapter, spy = binding
+        authority = pool.host if pool.port == 443 else f"{pool.host}:{pool.port}"
+        prepared_request = requests.PreparedRequest()
+        prepared_request.prepare(
+            method=method,
+            url=f"https://{authority}{url}",
+            headers=dict(headers or {}),
+            data=body,
+        )
+        try:
+            response = spy.send_pilot(adapter, prepared_request, **kwargs)
+        except requests.Timeout as exc:
+            raise ReadTimeoutError(pool, url, str(exc)) from exc
+        return HTTPResponse(
+            body=BytesIO(response.content),
+            status=response.status_code,
+            headers={
+                **response.headers,
+                "Content-Length": str(len(response.content)),
+            },
+            preload_content=False,
+            reason=response.reason or "",
+        )
 
-    monkeypatch.setattr(transport_module, "_HTTP_ADAPTER_SEND", synthetic_adapter_send)
+    monkeypatch.setattr(HTTPSConnectionPool, "urlopen", synthetic_urlopen)
     yield
-    _ADAPTER_SPIES.clear()
+    _POOL_SPIES.clear()
 
 
 def _pilot(
@@ -239,7 +268,8 @@ def _pilot(
     assert client._calendar_list_transport is None
     transport = CalendarListPilotTransport(client)
     client._calendar_list_transport = transport
-    _ADAPTER_SPIES[id(transport._adapter)] = spy
+    pool = transport._adapter.poolmanager.connection_from_url(client.config.endpoint)
+    _POOL_SPIES[(pool.host, pool.port)] = (transport._adapter, spy)
     return CalendarListSmokePilot(client), client, spy
 
 
@@ -308,6 +338,13 @@ def test_pilot_rejects_every_other_operation(operation: str) -> None:
         pilot.authorize(operation, {"limit": 1, "offset": 0})
 
     assert session.methods == ["tools/list"]
+
+
+def test_pilot_rejects_whitespace_padded_discovered_tool_name() -> None:
+    descriptor = replace(_tool("Calendar.list"), name=" Calendar.list ")
+
+    with pytest.raises(KeystoneProtocolError, match="malformed tool metadata"):
+        _pilot((descriptor,))
 
 
 @pytest.mark.parametrize(
@@ -438,6 +475,53 @@ def test_pilot_response_is_schema_checked_but_withheld_from_goals() -> None:
     assert parsed.structured_content is None
     assert not parsed.pagination_ready
     assert parsed.unresolved_contract is not None
+    assert session.methods == ["tools/list"]
+
+
+def test_pilot_accepts_structured_content_with_text_without_exposing_either() -> None:
+    pilot, _, session = _pilot()
+    page = _page(data=[{"id": "synthetic-sensitive-row"}])
+    text = json.dumps(page, separators=(",", ":"))
+    message = {
+        "jsonrpc": "2.0",
+        "id": 17,
+        "result": {
+            "content": [{"type": "text", "text": text}],
+            "structuredContent": page,
+        },
+    }
+
+    parsed = pilot.parse_response(_grant(pilot), message, 17)
+
+    assert parsed.content_kind is McpContentKind.MIXED
+    assert parsed.output_schema_validated
+    assert parsed.structured_content is None
+    assert parsed.text_content == ()
+    assert not parsed.pagination_ready
+    assert "synthetic-sensitive-row" not in repr(parsed)
+    assert text not in repr(parsed)
+    assert session.methods == ["tools/list"]
+
+
+def test_pilot_rejects_text_only_json_even_when_it_matches_page_schema() -> None:
+    pilot, _, session = _pilot()
+    text = json.dumps(_page(), separators=(",", ":"))
+    message = {
+        "jsonrpc": "2.0",
+        "id": 17,
+        "result": {
+            "content": [{"type": "text", "text": text}],
+        },
+    }
+
+    with pytest.raises(
+        KeystoneProtocolError,
+        match="success must contain structuredContent",
+    ) as caught:
+        pilot.parse_response(_grant(pilot), message, 17)
+
+    assert text not in str(caught.value)
+    assert text not in repr(caught.value)
     assert session.methods == ["tools/list"]
 
 
@@ -842,8 +926,11 @@ def _failure_response(
     result: dict[str, Any] = {"content": [], "structuredContent": _page()}
     if failure == "text_only":
         result = {"content": [{"type": "text", "text": "not resource data"}]}
-    elif failure == "mixed":
-        result["content"] = [{"type": "text", "text": "candidate plus text"}]
+    elif failure == "unsupported_mixed":
+        result["content"] = [
+            {"type": "text", "text": "candidate plus text"},
+            {"type": "image", "data": "opaque"},
+        ]
     elif failure == "unsupported":
         result["content"] = [{"type": "image", "data": "opaque"}]
     elif failure == "missing_content":
@@ -903,7 +990,7 @@ def _failure_response(
         ("malformed_rpc_error", KeystoneProtocolError),
         ("mcp_error", KeystoneToolError),
         ("text_only", KeystoneProtocolError),
-        ("mixed", KeystoneProtocolError),
+        ("unsupported_mixed", KeystoneProtocolError),
         ("unsupported", KeystoneProtocolError),
         ("missing_content", KeystoneProtocolError),
         ("missing_structured", KeystoneProtocolError),
@@ -938,6 +1025,25 @@ def test_every_transport_or_response_failure_consumes_attempt_without_retry(
     assert spy.methods == ["tools/list", "tools/call"]
     assert sum(method == "tools/call" for method in spy.methods) == 1
     assert [call["json"]["id"] for call in spy.calls] == [1, 2]
+
+
+def test_pilot_rejects_success_envelope_missing_structured_content() -> None:
+    pilot, client, spy = _pilot()
+    grant = _grant(pilot)
+    spy.business_response = lambda request: _Response({
+        "jsonrpc": "2.0",
+        "id": request["id"],
+        "result": {"content": []},
+    })
+
+    with pytest.raises(KeystoneProtocolError) as caught:
+        pilot.invoke(grant)
+
+    assert str(caught.value) == "Calendar.list success must contain structuredContent."
+    assert client._calendar_list_attempted
+    with pytest.raises(KeystoneOperationNotAllowedError, match="already been consumed"):
+        pilot.invoke(grant)
+    assert spy.methods == ["tools/list", "tools/call"]
 
 
 def test_json_decode_failure_does_not_retain_raw_response_in_exception_chain() -> None:
@@ -976,6 +1082,7 @@ def test_production_transport_owns_https_only_zero_retry_session() -> None:
     pilot, client, _ = _pilot()
     transport = client._calendar_list_transport
     assert isinstance(transport, CalendarListPilotTransport)
+    assert client.config.is_approved_pilot_origin
 
     assert transport._session is not client._session
     assert type(transport._session) is requests.Session
@@ -1057,6 +1164,49 @@ def test_transport_rejects_unexpected_private_configuration(
     assert spy.methods == ["tools/list"]
     assert not client._calendar_list_attempted
     assert client._next_request_id == 2
+
+
+def test_transport_rejects_hosted_runner_destination() -> None:
+    for base_url in (
+        "https://runner.example.test",
+        "https://runner.example.test/tenant/keystone",
+        "https://class.agentswitch.theschoolofai.in:8443",
+    ):
+        client = KeystoneClient(
+            KeystoneConfig.for_hosted_runner(
+                base_url=base_url,
+                token="offline-test-token",
+            )
+        )
+        with pytest.raises(KeystoneOperationNotAllowedError):
+            CalendarListPilotTransport(client)
+
+
+def test_transport_rejects_replaced_adapter_send_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pilot, client, spy = _pilot()
+    grant = _grant(pilot)
+    standard_sender = transport_module._STANDARD_HTTP_ADAPTER_SEND
+    called = False
+
+    def replacement_sender(
+        adapter: HTTPAdapter,
+        prepared_request: requests.PreparedRequest,
+        **kwargs: Any,
+    ) -> requests.Response:
+        nonlocal called
+        called = True
+        return standard_sender(adapter, prepared_request, **kwargs)
+
+    monkeypatch.setattr(transport_module, "_STANDARD_HTTP_ADAPTER_SEND", replacement_sender)
+
+    with pytest.raises(KeystoneOperationNotAllowedError):
+        pilot.invoke(grant)
+
+    assert not called
+    assert spy.methods == ["tools/list"]
+    assert not client._calendar_list_attempted
 
 
 def test_transport_constructor_exposes_only_client_binding_and_zero_retries() -> None:

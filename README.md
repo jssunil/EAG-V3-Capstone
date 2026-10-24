@@ -1,9 +1,8 @@
+# EAG V3 Capstone
 
 ## Persisted evaluation boundary
 
 `RawRunJournal` writes a versioned JSON artifact containing the complete `RawRun` evidence and an `EvaluationManifest` before scoring. The journal redacts credential-shaped fields and bearer values, and its loader rejects malformed, incomplete, or incompatible artifacts. `DeterministicScorer` consumes a loaded run plus independently supplied predicate state and returns only `approve`, `revise`, or `unevaluated`; unavailable live predicates always produce `unevaluated`, which is never a pass. Scoring does not invoke the model, `CalendarAgent`, MCP, or mutations, so a stored run can be rescored with a new scorer version without rerunning it.
-# EAG V3 Capstone
-
 ## Seat 19: Scheduling
 
 This repository contains the implementation of Seat 19's Calendar Agent. Its charter is:
@@ -14,7 +13,17 @@ The official goals are `calendar.find_30_minutes` and `calendar.move_after_audit
 
 ## Current Status
 
-The read-only AgentSwitch integration and the first planning/harness architecture pass are available. The current agent does not execute mutations or claim either goal is complete. It provides:
+The repository contains deterministic read-only goal handlers, an optional
+provider-injected runtime, a hosted runner for both supported instances, and
+an offline-first Keystone adapter. Keystone business reads remain disabled
+for default clients; the hosted runner explicitly opts into only the four
+allowlisted resource reads. Neither goal performs calendar mutations, and
+`PLANNED` is not equivalent to a completed goal.
+The older AgentSwitch path and the hosted harness are separate and can contact
+live services when explicitly invoked with credentials. This repository
+snapshot does not verify their live behavior.
+
+The project provides:
 
 - environment-backed authentication configuration
 - a reusable JSON-RPC 2.0 MCP client
@@ -43,8 +52,10 @@ The `CalendarAgent` owns orchestration and structured results. Goal handlers own
 
 The handlers remain read-only and stop before event execution:
 
-- `calendar.find_30_minutes` can return a structured, state-supported candidate slot when a deterministic Party, owned calendar, linked availability rule, visible free/busy result, minimum-notice window, and 30-minute preference are all available. It cannot identify a unique Plant Manager from current live Party data, and hidden/not-shared free/busy is not treated as free.
-- `calendar.move_after_audit` can return a read-only `PLANNED` rescheduling plan when exactly one audit is resolved and an explicit positive shift is supplied; it does not move any events.
+- `calendar.find_30_minutes` can return a structured, state-supported candidate slot when a deterministic Party, owned calendar, linked availability rule, visible free/busy result, minimum-notice window, and 30-minute preference are all available. Hidden/not-shared free/busy is not treated as free. Current live data was not rechecked for this documentation snapshot.
+- `calendar.move_after_audit` can return a read-only `PLANNED` rescheduling plan when exactly one audit is resolved, an
+  explicit calendar scope and positive shift are supplied, and every `CalendarEvent.list` page is validated as complete;
+  it does not move any events.
 
 Goal 1 never creates or books the candidate event, and Goal 2 never updates events. `PLANNED` means only that the read-only state supports a candidate slot or rescheduling plan; it is not equivalent to booking or moving events. The official evaluator predicates/scorer and final mutation semantics remain unavailable and unknown.
 
@@ -68,11 +79,59 @@ These fixtures are local test data only. Planning remains distinct from executio
 
 ### Hosted AgentSwitch harness
 
-`agentswitch-harness.toml` selects Suryodaya only and invokes `harnesses.suryodaya_harness.hosted_runner`. The hosted process reads `AGENTSWITCH_INSTANCE`, `AGENTSWITCH_BASE_URL`, and `AGENTSWITCH_TOKEN` from the runner; it does not read local credentials or `.env` files. The base URL must be an absolute credential-free HTTPS instance base URL. The client appends `/api/mcp`, so that endpoint itself must not be supplied. Query strings and fragments are rejected.
+`agentswitch-harness.toml` selects both Suryodaya and Keystone and invokes
+`harnesses.suryodaya_harness.hosted_runner`. The hosted process reads
+`AGENTSWITCH_INSTANCE`, `AGENTSWITCH_BASE_URL`, and `AGENTSWITCH_TOKEN` from
+the runner; it does not read local credentials or `.env` files. The base URL
+must be an absolute credential-free HTTP or HTTPS instance base URL. The
+client appends `/api/mcp`, so that endpoint itself must not be supplied. Query
+strings and fragments are rejected.
 
-The hosted check invokes the read-only `calendar.find_30_minutes` planner over a rolling 14-day window. A structurally verified candidate is still reported as `UNEVALUATED`: the official goal predicate is not available in this repository, and proposing a slot does not prove the business goal passed. Missing or invalid configuration also produces an unevaluated, non-passing result. The CLI's zero exit status means only that the result artifact was written; it does not mean a business goal passed. No event or booking mutation is attempted. The locally runnable `python -m harnesses.suryodaya_harness` demo remains fixture-based and does not submit or contact a live instance.
+The hosted runner includes separate read-only tasks for
+`calendar.find_30_minutes` and `calendar.move_after_audit`. For Suryodaya, Goal 1 candidates remain
+`UNEVALUATED` because no authoritative Goal 1 predicate is available. Goal 2
+resolves `EVT-2026-00007` by its supported event-number filter, checks
+its title, confirmed status, and event-associated calendar, and requires a
+complete event listing before planning. Explicit offsets remain instants.
+When a timestamp has no event timezone, the instructor-confirmed rule is to
+use the owning calendar's timezone, then the company's timezone. The current
+tool interface can read the owning calendar timezone but does not expose a
+separate company-timezone read; it fails closed if no usable timezone is
+returned until the server applies the documented fallback. Ambiguous and
+nonexistent local times fail closed. Offset-versus-IANA precedence remains
+unverified. The
+30-minute proposal is presented for confirmation or change; events are never
+updated. A Goal 2 result is non-passing when clarification or incomplete
+evidence prevents a plan. A `passed` Goal 2 result represents
+the local read-only plan check against the instructor's stated criteria, not
+an invocation of the official evaluator.
 
-The repository does not establish the exact hosted Suryodaya URL. Obtain that value and its path/origin requirements from the authoritative runner configuration before submission; do not infer it from the local default URL.
+For Keystone, the hosted-only client requires an observed, schema-validated
+`tools/list` descriptor for each read tool before making one-shot `tools/call` requests for
+`Party.list`, `Calendar.list`, `CalendarEvent.list`, or `EventAttendee.list`.
+Only `structuredContent` matching the discovered output schema is used;
+text-only results fail closed. Goal 1 remains non-passing because Keystone
+does not expose the required preference, availability-rule, or free/busy
+capabilities, and no authoritative Goal 1 predicate is available. Goal 2
+requires exactly one audit search result and its owning calendar before
+producing a 30-minute plan for confirmation. These are local harness checks,
+not official evaluator results. `results.json` reports the checks and the
+runner summary explicitly says `official_evaluator=not_invoked`.
+
+The earlier live Suryodaya snapshot could not produce a Goal 2 plan under the
+then-strict timestamp parser because event timestamps lacked offsets and most
+records had no event timezone. The explicit fallback can now support a
+read-only proposal, but that snapshot was not re-read and pagination snapshot
+consistency remains unverified. The Goal 1 snapshot also lacked matching
+availability rules and shared free/busy access. These are not goal passes.
+The hosted runner does not mutate events, and the local
+`python -m harnesses.suryodaya_harness` demo remains fixture-based and does not
+contact a live instance.
+
+The interactive read-only checks used the instructor-provided
+`https://agentswitch.theschoolofai.in` endpoint. Hosted execution must use
+the platform-injected instance URL and credentials; do not hardcode or infer
+credentials from local files.
 
 Replay and rescore an existing artifact without rerunning the Agent:
 
@@ -98,10 +157,16 @@ For bearer-token authentication, set:
 $env:AGENTSWITCH_TOKEN = "your-local-token"
 ```
 
-Optional settings:
+The instance base URL must also be supplied explicitly by the authorized
+runtime. `AGENTSWITCH_BASE_URL` has no public default; the client appends
+`/api/mcp` to the supplied instance base URL.
+For local use, set it in the PowerShell session to the authorized HTTPS
+instance base URL before invoking `scripts/run.ps1`; that helper bootstraps
+the token but does not choose or supply the instance URL.
+
+Optional setting:
 
 ```powershell
-$env:AGENTSWITCH_BASE_URL = "https://agentswitch.theschoolofai.in"
 $env:AGENTSWITCH_TIMEOUT_SECONDS = "10"
 ```
 
@@ -132,6 +197,11 @@ The unit tests do not require AgentSwitch credentials or network access:
 python -m pytest
 ```
 
+The workspace's VS Code settings enable pytest discovery under `tests`. Use
+VS Code `#runTests` and confirm that the intended test nodes were collected
+when the task requires Testing-panel evidence; an aggregate result is not
+proof that a newly added test was included.
+
 Run the read-only live smoke test through the persistent local authentication bootstrap:
 
 ```powershell
@@ -141,3 +211,23 @@ Run the read-only live smoke test through the persistent local authentication bo
 The smoke test calls `CalendarEvent.list` with `limit=1`, validates the MCP/JSON-RPC response, and prints only safe metadata. It talks to the live AgentSwitch environment and must not be used with credentials you do not intend to use there.
 
 LLM integration, evaluator/scorer integration, mutation execution, and successful mutation-based completion of both official Calendar goals remain intentionally unimplemented. The live environment does not expose the Seat 19 evaluator predicates, so this repository does not invent them.
+
+## Engineering documentation
+
+For a component map, start with
+[Engineering Architecture](docs/engineering/Architecture.md). The engineering
+documentation also records execution flows, decisions, safety constraints,
+bug/feature status, test evidence, recovery guidance, the current handover,
+and a progressive learning path:
+
+- [Architecture](docs/engineering/Architecture.md)
+- [Execution flows](docs/engineering/Flow.md)
+- [Decision log](docs/engineering/Decisions.md)
+- [Constraints](docs/engineering/Constraints.md)
+- [Bug register](docs/engineering/Bug.md)
+- [Feature register](docs/engineering/Feature.md)
+- [Test checklist](docs/engineering/Test-Checklist.md)
+- [Rollback guide](docs/engineering/Rollback.md)
+- [AI work log](docs/engineering/AI-Work-Log.md)
+- [Learning guide](docs/engineering/LEARNING-GUIDE.md)
+- [Current handover](docs/engineering/HANDOVER.md)

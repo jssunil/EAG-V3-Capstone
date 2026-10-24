@@ -40,11 +40,13 @@ def parse_mcp_tool_call_response(
     message: Any,
     request_id: int,
     output_schema: Mapping[str, Any] | None,
+    *,
+    expose_structured_content: bool = False,
 ) -> ParsedMcpToolCallResponse:
     """Classify a synthetic MCP response without assuming Keystone's wire shape.
 
-    Structured data is schema-checked but withheld until Keystone's envelope
-    contract and a live invocation path are separately reviewed.
+    Structured data is withheld by default. Hosted callers may opt into the
+    strictly schema-validated structured result; text is never parsed as data.
     """
 
     if type(request_id) is not int:
@@ -155,6 +157,15 @@ def parse_mcp_tool_call_response(
         if text_content or has_other_content
         else McpContentKind.STRUCTURED
     )
+    if expose_structured_content:
+        return ParsedMcpToolCallResponse(
+            request_id=request_id,
+            content_kind=kind,
+            structured_content=dict(candidate),
+            text_content=tuple(text_content),
+            output_schema_validated=True,
+            pagination_ready=True,
+        )
     return ParsedMcpToolCallResponse(
         request_id=request_id,
         content_kind=kind,
@@ -175,19 +186,35 @@ def parse_calendar_list_pilot_response(
 ) -> ParsedMcpToolCallResponse:
     """Validate the strict, unverified Calendar.list pilot envelope.
 
-    Successful responses require an exact JSON-RPC result envelope, an empty
-    ``content`` array, and structured page fields ``data``, ``total``, ``limit``,
-    and ``offset``. Candidate content is validated and then withheld.
+    Successful responses require an exact JSON-RPC result envelope,
+    ``structuredContent``, and a ``content`` array containing only well-formed
+    text blocks. The structured page is schema-checked and validated, but both
+    it and the text content are withheld.
     """
 
     _validate_calendar_list_pilot_envelope(message, request_id)
     parsed = parse_mcp_tool_call_response(message, request_id, output_schema)
+    content_kind = parsed.content_kind
+    output_schema_validated = parsed.output_schema_validated
+    structured_content_exposed = parsed.structured_content is not None
+    pagination_ready = parsed.pagination_ready
+    has_text_content = bool(parsed.text_content)
+    unresolved_contract = parsed.unresolved_contract
+    del parsed
+
     if (
-        parsed.content_kind is not McpContentKind.STRUCTURED
-        or not parsed.output_schema_validated
-        or parsed.structured_content is not None
-        or parsed.pagination_ready
-        or parsed.text_content
+        content_kind not in {McpContentKind.STRUCTURED, McpContentKind.MIXED}
+        or not output_schema_validated
+        or structured_content_exposed
+        or pagination_ready
+        or (
+            content_kind is McpContentKind.STRUCTURED
+            and has_text_content
+        )
+        or (
+            content_kind is McpContentKind.MIXED
+            and not has_text_content
+        )
     ):
         raise KeystoneProtocolError(
             "Calendar.list pilot response is not an unambiguous structured result."
@@ -218,7 +245,15 @@ def parse_calendar_list_pilot_response(
         raise KeystoneProtocolError(
             "Calendar.list pilot response disagrees with the fixed one-record request."
         )
-    return parsed
+    return ParsedMcpToolCallResponse(
+        request_id=request_id,
+        content_kind=content_kind,
+        structured_content=None,
+        text_content=(),
+        output_schema_validated=output_schema_validated,
+        pagination_ready=False,
+        unresolved_contract=unresolved_contract,
+    )
 
 
 def _validate_calendar_list_pilot_envelope(message: Any, request_id: int) -> None:
@@ -281,10 +316,7 @@ def _validate_calendar_list_pilot_envelope(message: Any, request_id: int) -> Non
         )
     if result.get("isError") is True:
         return
-    if (
-        "structuredContent" not in result
-        or result["content"] != []
-    ):
+    if "structuredContent" not in result:
         raise KeystoneProtocolError(
-            "Calendar.list success must contain structuredContent and an empty content array."
+            "Calendar.list success must contain structuredContent."
         )

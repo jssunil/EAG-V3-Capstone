@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -94,7 +95,10 @@ def complete_goal_two_tools() -> FakeCalendarTools:
         "calendar_id": "calendar-1",
         "status": "confirmed",
     }
-    return FakeCalendarTools(events=[audit, after])
+    return FakeCalendarTools(
+        events=[audit, after],
+        calendars=[{"id": "calendar-1", "timezone": "Asia/Kolkata"}],
+    )
 
 
 def test_suryodaya_candidate_is_unevaluated_even_when_structurally_valid() -> None:
@@ -138,7 +142,7 @@ def test_goal_two_plan_requires_confirmation_and_performs_no_mutation() -> None:
     assert all(not call.mutating for call in tools.trace)
 
 
-def test_goal_two_uses_explicit_kolkata_fallback_for_naive_times() -> None:
+def test_goal_two_uses_owning_calendar_timezone_for_naive_times() -> None:
     tools = complete_goal_two_tools()
     for event in tools.events:
         event["start_at"] = str(event["start_at"]).split("+", 1)[0]
@@ -151,6 +155,23 @@ def test_goal_two_uses_explicit_kolkata_fallback_for_naive_times() -> None:
     assert "confirmation_required=true" in check.evidence
     assert "2026-09-19T14:00:00+05:30" in check.evidence
     assert "mutation_attempts=0" in check.evidence
+    assert any(call.tool == "Calendar.get" for call in tools.trace)
+    assert all(not call.mutating for call in tools.trace)
+
+
+def test_goal_two_fails_closed_without_event_or_calendar_timezone() -> None:
+    tools = complete_goal_two_tools()
+    tools.calendars[0].pop("timezone")
+    for event in tools.events:
+        event["start_at"] = str(event["start_at"]).split("+", 1)[0]
+        event["end_at"] = str(event["end_at"]).split("+", 1)[0]
+        event["timezone"] = None
+
+    check = check_suryodaya_goal_two(tools)
+
+    assert not check.passed
+    assert "did not produce a plan" in check.evidence
+    assert any(call.tool == "Calendar.get" for call in tools.trace)
     assert all(not call.mutating for call in tools.trace)
 
 
@@ -194,15 +215,36 @@ def test_hosted_environment_uses_platform_injected_secure_instance_url() -> None
     assert config.base_url == "https://runner.example.test:8443/tenant/suryodaya"
 
 
+def test_hosted_environment_accepts_keystone_and_internal_http_url() -> None:
+    config = load_hosted_environment({
+        "AGENTSWITCH_INSTANCE": "Keystone",
+        "AGENTSWITCH_BASE_URL": "http://runner.internal:8000/tenant/keystone",
+        "AGENTSWITCH_TOKEN": "secret-token",
+    })
+
+    assert config.instance == "keystone"
+    assert config.base_url == "http://runner.internal:8000/tenant/keystone"
+
+
+def test_hosted_environment_accepts_platform_injected_http_instance_url() -> None:
+    config = load_hosted_environment({
+        "AGENTSWITCH_INSTANCE": "suryodaya",
+        "AGENTSWITCH_BASE_URL": "http://runner.example.test:8000/tenant/suryodaya",
+        "AGENTSWITCH_TOKEN": "secret-token",
+    })
+
+    assert config.base_url == "http://runner.example.test:8000/tenant/suryodaya"
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
         ("AGENTSWITCH_BASE_URL", "", "must be set"),
-        ("AGENTSWITCH_BASE_URL", "http://runner.example.test", "HTTPS"),
+        ("AGENTSWITCH_BASE_URL", "ftp://runner.example.test", "HTTP\\(S\\)"),
         ("AGENTSWITCH_BASE_URL", "https://user:password@runner.example.test", "credential-free"),
         ("AGENTSWITCH_BASE_URL", "https://runner.example.test/api/mcp", "instance base URL"),
         ("AGENTSWITCH_BASE_URL", "https://runner.example.test?tenant=suryodaya", "query or fragment"),
-        ("AGENTSWITCH_INSTANCE", "keystone", "Only the Suryodaya"),
+        ("AGENTSWITCH_INSTANCE", "unsupported", "Suryodaya or Keystone"),
     ],
 )
 def test_hosted_environment_rejects_invalid_configuration(field, value, message) -> None:
@@ -245,7 +287,7 @@ def test_hosted_configuration_error_is_unevaluated_and_secret_safe(tmp_path: Pat
     output_path, checks = run_hosted(
         {
             "AGENTSWITCH_INSTANCE": "suryodaya",
-            "AGENTSWITCH_BASE_URL": "http://runner.example.test",
+            "AGENTSWITCH_BASE_URL": "ftp://runner.example.test",
             "AGENTSWITCH_TOKEN": "secret-token",
         },
         output_path=tmp_path / "results.json",
@@ -337,11 +379,10 @@ def test_suryodaya_candidate_does_not_serialize_as_predicate_success(
     assert "official_evaluator=not_invoked" in document["summary"]
 
 
-def test_hosted_toml_selects_suryodaya_only() -> None:
+def test_hosted_toml_selects_both_supported_instances() -> None:
     config = Path("agentswitch-harness.toml").read_text(encoding="utf-8")
 
-    assert 'instances = ["suryodaya"]' in config
-    assert "keystone" not in config
+    assert 'instances = ["suryodaya", "keystone"]' in config
 
 
 def test_tool_trace_summary_does_not_include_party_data() -> None:
@@ -388,3 +429,88 @@ def test_run_hosted_dispatches_suryodaya_check_and_writes_contract_results(
     assert "Goal 2 did not produce a plan" in document["tasks"][1]["evidence"]
     assert "official_evaluator=not_invoked" in document["summary"]
     assert "secret-token" not in results_path.read_text(encoding="utf-8")
+
+
+def test_run_hosted_dispatches_keystone_without_live_calls(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        hosted_runner.KeystoneClient,
+        "list_tools",
+        lambda self: SimpleNamespace(
+            tools=tuple(
+                SimpleNamespace(name=name)
+                for name in hosted_runner.RESOURCE_READ_OPERATIONS
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        hosted_runner,
+        "check_keystone_goal_one",
+        lambda adapter, **kwargs: hosted_runner._task(
+            task_id="keystone.goal1_read_only_candidate",
+            title="Keystone Goal 1",
+            passed=False,
+            evidence="UNEVALUATED: fixture.",
+        ),
+    )
+    monkeypatch.setattr(
+        hosted_runner,
+        "check_keystone_goal_two",
+        lambda adapter, **kwargs: hosted_runner._task(
+            task_id="keystone.goal2_read_only_plan",
+            title="Keystone Goal 2",
+            passed=False,
+            evidence="UNEVALUATED: fixture.",
+        ),
+    )
+
+    output_path, checks = run_hosted(
+        {
+            "AGENTSWITCH_INSTANCE": "keystone",
+            "AGENTSWITCH_BASE_URL": "http://runner.internal:8000/tenant/keystone",
+            "AGENTSWITCH_TOKEN": "secret-token",
+        },
+        output_path=tmp_path / "results.json",
+        now=NOW,
+    )
+
+    document = parse_results(output_path.read_text(encoding="utf-8"))
+    assert [check.task_id for check in checks] == [
+        "keystone.mcp_tools_list",
+        "keystone.goal1_read_only_candidate",
+        "keystone.goal2_read_only_plan",
+    ]
+    assert document["tasks"][0]["passed"] is True
+    assert document["tasks"][1]["passed"] is False
+    assert document["tasks"][2]["passed"] is False
+    assert "official_evaluator=not_invoked" in document["summary"]
+    assert "secret-token" not in output_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(("passed", "expected_exit_code"), [(True, 0), (False, 1)])
+def test_main_exit_code_reflects_task_results(
+    monkeypatch,
+    tmp_path: Path,
+    passed: bool,
+    expected_exit_code: int,
+) -> None:
+    output_path = tmp_path / "results.json"
+    checks = (
+        hosted_runner._task(
+            task_id="fixture",
+            title="Fixture task",
+            passed=passed,
+            evidence="fixture evidence",
+        ),
+    )
+    monkeypatch.setattr(
+        hosted_runner,
+        "run_hosted",
+        lambda environment, *, output_path: (output_path, checks),
+    )
+
+    exit_code = hosted_runner.main(["--results", str(output_path)])
+
+    assert exit_code == expected_exit_code

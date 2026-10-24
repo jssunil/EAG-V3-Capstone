@@ -1,4 +1,4 @@
-"""Guarded MCP transport foundation; no Keystone operations are enabled yet."""
+"""Guarded MCP transport with an explicit hosted read-only opt-in."""
 
 from __future__ import annotations
 
@@ -134,40 +134,55 @@ class _CalendarListPilotRequest:
     output_schema: dict[str, Any] | None = field(repr=False)
 
 
-# Diagnostic declaration only. call_read has no transport execution path.
+# Generic call_read remains disabled; hosted reads require a separate opt-in.
 PRODUCTION_READ_ONLY_OPERATIONS: tuple[str, ...] = ()
+_HOSTED_MCP_PROTOCOL_VERSION = "2025-11-25"
 
 
 class KeystoneClient:
-    """Keystone client limited to protocol discovery; business tools stay disabled.
+    """Keystone client with discovery-only defaults and hosted read opt-in.
 
-    ``tools/list`` discovers metadata but cannot invoke a business operation.
-    ``call_read`` remains disabled until trusted operation approval exists.
+    ``tools/list`` discovers metadata. Raw ``call_read`` stays disabled;
+    hosted clients may invoke only client-authorized resource reads.
     """
 
     def __init__(
         self,
         config: KeystoneConfig,
         session: requests.Session | None = None,
+        *,
+        enable_hosted_read_transport: bool = False,
     ) -> None:
         if not isinstance(config, KeystoneConfig):
             raise TypeError("config must be a KeystoneConfig")
+        if type(enable_hosted_read_transport) is not bool:
+            raise TypeError("enable_hosted_read_transport must be a boolean")
+        if enable_hosted_read_transport and not config.is_hosted_runner_config:
+            raise KeystoneOperationNotAllowedError(
+                "Hosted read transport requires platform-injected runner configuration."
+            )
         self.config = config
         self._session = session if session is not None else requests.Session()
+        self._hosted_read_transport_enabled = enable_hosted_read_transport
         self._authorization_identity = object()
         self._discovery_result: ToolDiscoveryResult | None = None
         self._discovery_tools_snapshot: tuple[DiscoveredTool, ...] | None = None
         self._discovery_config: KeystoneConfig | None = None
         self._discovery_session: object | None = None
         self._issued_read_authorizations: WeakSet[KeystoneReadAuthorization] = WeakSet()
+        self._consumed_hosted_read_authorizations: WeakSet[KeystoneReadAuthorization] = WeakSet()
         self._state_lock = threading.RLock()
         self._discovery_in_progress = False
         self._calendar_list_attempted = False
-        self._next_request_id = 2
+        self._next_request_id = 3 if enable_hosted_read_transport else 2
+        self._hosted_initialized = False
         self._calendar_list_transport: CalendarListPilotTransport | None = None
 
     def list_tools(self) -> ToolDiscoveryResult:
-        """Fetch only the MCP tool catalog; never invoke a listed tool."""
+        """Initialize opted-in hosted sessions, then fetch the MCP tool catalog."""
+
+        if self._hosted_read_transport_enabled:
+            self._initialize_hosted_session()
 
         with self._state_lock:
             if self._calendar_list_attempted:
@@ -202,9 +217,10 @@ class KeystoneClient:
                 "Set KEYSTONE_TOKEN to discover Keystone MCP tools."
             ) from None
 
+        request_id = 2 if self._hosted_read_transport_enabled else 1
         payload = {
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": request_id,
             "method": "tools/list",
             "params": {},
         }
@@ -218,29 +234,31 @@ class KeystoneClient:
                 },
                 json=payload,
                 timeout=self.config.timeout,
+                allow_redirects=False,
             )
         except requests.Timeout as exc:
             raise KeystoneTimeoutError("Keystone tool discovery timed out.") from exc
         except requests.RequestException as exc:
             raise KeystoneTransportError("Keystone tool discovery failed.") from exc
 
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            if response.status_code == 401:
+        status_code = getattr(response, "status_code", None)
+        if type(status_code) is not int:
+            raise KeystoneProtocolError("Keystone tool discovery returned an invalid HTTP status.")
+        if not 200 <= status_code < 300:
+            if status_code == 401:
                 raise KeystoneAuthenticationError(
                     "Keystone rejected the authenticated tool-discovery request."
-                ) from exc
+                )
             raise KeystoneHttpError(
-                f"Keystone returned HTTP {response.status_code} for tool discovery."
-            ) from exc
+                f"Keystone returned HTTP {status_code} for tool discovery."
+            )
 
         try:
             message = response.json()
         except ValueError as exc:
             raise KeystoneJsonError("Keystone returned invalid JSON.") from exc
 
-        result = self._parse_response(message, 1)
+        result = self._parse_response(message, request_id)
         tools = result.get("tools")
         if not isinstance(tools, list):
             raise KeystoneProtocolError("Keystone tools/list result has no tools array.")
@@ -258,7 +276,8 @@ class KeystoneClient:
             meta = item.get("_meta")
             if (
                 not isinstance(name, str)
-                or not name.strip()
+                or not name
+                or name != name.strip()
                 or (description is not None and not isinstance(description, str))
                 or not isinstance(input_schema, dict)
                 or not isinstance(annotations, dict)
@@ -270,16 +289,15 @@ class KeystoneClient:
                 )
             if "_meta" in item and not isinstance(meta, dict):
                 raise KeystoneProtocolError("Keystone tool _meta metadata is malformed.")
-            normalized_name = name.strip()
-            if normalized_name in discovered_names:
+            if name in discovered_names:
                 raise KeystoneProtocolError("Keystone tools/list contains duplicate tool names.")
-            discovered_names.add(normalized_name)
+            discovered_names.add(name)
             read_only_hint = annotations.get("readOnlyHint")
             if read_only_hint is not None and type(read_only_hint) is not bool:
                 raise KeystoneProtocolError("Keystone tool read-only metadata is malformed.")
             discovered.append(
                 DiscoveredTool(
-                    name=normalized_name,
+                    name=name,
                     read_only_hint=read_only_hint,
                     description=description,
                     input_schema=dict(input_schema),
@@ -332,6 +350,123 @@ class KeystoneClient:
             completeness=completeness,
         )
         return discovery
+
+    def _initialize_hosted_session(self) -> None:
+        """Perform the MCP initialization handshake only for hosted opt-in clients."""
+
+        with self._state_lock:
+            if self._hosted_initialized:
+                return
+            config = self.config
+            session = self._session
+            try:
+                token = config.require_token()
+            except KeystoneConfigurationError:
+                raise KeystoneAuthenticationError(
+                    "Set AGENTSWITCH_TOKEN to initialize the hosted Keystone session."
+                ) from None
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        initialize_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": _HOSTED_MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "eag-v3-calendar-harness",
+                    "version": "0.1.0",
+                },
+            },
+        }
+        try:
+            response = session.post(
+                config.endpoint,
+                headers=headers,
+                json=initialize_payload,
+                timeout=config.timeout,
+                allow_redirects=False,
+            )
+        except requests.Timeout as exc:
+            raise KeystoneTimeoutError("Keystone MCP initialization timed out.") from exc
+        except requests.RequestException as exc:
+            raise KeystoneTransportError("Keystone MCP initialization failed.") from exc
+
+        status_code = getattr(response, "status_code", None)
+        if type(status_code) is not int:
+            raise KeystoneProtocolError(
+                "Keystone MCP initialization returned an invalid HTTP status."
+            )
+        if not 200 <= status_code < 300:
+            if status_code == 401:
+                raise KeystoneAuthenticationError(
+                    "Keystone rejected MCP initialization."
+                )
+            raise KeystoneHttpError(
+                f"Keystone returned HTTP {status_code} for MCP initialization."
+            )
+        try:
+            message = response.json()
+        except ValueError as exc:
+            raise KeystoneJsonError(
+                "Keystone MCP initialization returned invalid JSON."
+            ) from exc
+
+        result = self._parse_response(message, 1)
+        if (
+            result.get("protocolVersion") != _HOSTED_MCP_PROTOCOL_VERSION
+            or not isinstance(result.get("capabilities"), Mapping)
+            or not isinstance(result.get("serverInfo"), Mapping)
+        ):
+            raise KeystoneProtocolError(
+                "Keystone MCP initialization result does not match the supported protocol."
+            )
+
+        try:
+            response = session.post(
+                config.endpoint,
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {},
+                },
+                timeout=config.timeout,
+                allow_redirects=False,
+            )
+        except requests.Timeout as exc:
+            raise KeystoneTimeoutError(
+                "Keystone MCP initialized notification timed out."
+            ) from exc
+        except requests.RequestException as exc:
+            raise KeystoneTransportError(
+                "Keystone MCP initialized notification failed."
+            ) from exc
+
+        status_code = getattr(response, "status_code", None)
+        if type(status_code) is not int:
+            raise KeystoneProtocolError(
+                "Keystone MCP initialized notification returned an invalid HTTP status."
+            )
+        if not 200 <= status_code < 300:
+            if status_code == 401:
+                raise KeystoneAuthenticationError(
+                    "Keystone rejected the MCP initialized notification."
+                )
+            raise KeystoneHttpError(
+                f"Keystone returned HTTP {status_code} for MCP initialized notification."
+            )
+        with self._state_lock:
+            if self.config is not config or self._session is not session:
+                raise KeystoneOperationNotAllowedError(
+                    "Hosted Keystone client state changed during MCP initialization."
+                )
+            self._hosted_initialized = True
 
     def authorize_read_request(
         self,
@@ -410,6 +545,7 @@ class KeystoneClient:
         self._discovery_config = None
         self._discovery_session = None
         self._issued_read_authorizations.clear()
+        self._consumed_hosted_read_authorizations.clear()
 
     def _require_owned_discovery(self) -> ToolDiscoveryResult:
         if self._discovery_in_progress:
@@ -436,7 +572,7 @@ class KeystoneClient:
         operation: str,
         arguments: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Reject every operation until trusted approval and transport are designed."""
+        """Reject raw tool requests; callers must use a client-issued authorization."""
 
         raise KeystoneOperationNotAllowedError(
             "No Keystone operation has trusted approval; transport is disabled."
@@ -446,12 +582,99 @@ class KeystoneClient:
         self,
         authorization: KeystoneReadAuthorization,
     ) -> dict[str, Any]:
-        """Validate a client-owned capability, then keep transport disabled."""
+        """Perform one schema-validated hosted read from the exact resource allowlist."""
 
-        self.validate_read_authorization(authorization)
-        raise KeystoneOperationNotAllowedError(
-            "Keystone read transport is disabled."
+        if not self._hosted_read_transport_enabled:
+            raise KeystoneOperationNotAllowedError(
+                "Keystone read transport is disabled."
+            )
+
+        from .authorization import RESOURCE_READ_OPERATIONS
+        from .mcp_response import parse_mcp_tool_call_response
+
+        with self._state_lock:
+            descriptor = self.validate_read_authorization(authorization)
+            if authorization.operation not in RESOURCE_READ_OPERATIONS:
+                raise KeystoneOperationNotAllowedError(
+                    "Keystone hosted read is not in the exact resource allowlist."
+                )
+            if authorization in self._consumed_hosted_read_authorizations:
+                raise KeystoneOperationNotAllowedError(
+                    "A Keystone hosted read authorization can be used only once."
+                )
+            if not isinstance(descriptor.output_schema, Mapping):
+                raise KeystoneProtocolError(
+                    "Keystone hosted reads require a discovered output schema."
+                )
+            config = self.config
+            session = self._session
+            try:
+                token = config.require_token()
+            except KeystoneConfigurationError:
+                raise KeystoneAuthenticationError(
+                    "Set AGENTSWITCH_TOKEN for hosted Keystone reads."
+                ) from None
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            self._consumed_hosted_read_authorizations.add(authorization)
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": authorization.operation,
+                "arguments": authorization.arguments,
+            },
+        }
+        try:
+            response = session.post(
+                config.endpoint,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+                json=payload,
+                timeout=config.timeout,
+                allow_redirects=False,
+            )
+        except requests.Timeout as exc:
+            raise KeystoneTimeoutError("Keystone hosted read timed out.") from exc
+        except requests.RequestException as exc:
+            raise KeystoneTransportError("Keystone hosted read failed.") from exc
+
+        status_code = getattr(response, "status_code", None)
+        if type(status_code) is not int:
+            raise KeystoneProtocolError("Keystone hosted read returned an invalid HTTP status.")
+        if not 200 <= status_code < 300:
+            if status_code == 401:
+                raise KeystoneAuthenticationError(
+                    "Keystone rejected the authenticated hosted read."
+                )
+            raise KeystoneHttpError(
+                f"Keystone returned HTTP {status_code} for a hosted read."
+            )
+        try:
+            message = response.json()
+        except ValueError as exc:
+            raise KeystoneJsonError("Keystone hosted read returned invalid JSON.") from exc
+
+        parsed = parse_mcp_tool_call_response(
+            message,
+            request_id,
+            descriptor.output_schema,
+            expose_structured_content=True,
         )
+        if (
+            not parsed.pagination_ready
+            or parsed.structured_content is None
+            or not parsed.output_schema_validated
+        ):
+            raise KeystoneProtocolError(
+                "Keystone hosted read did not return a validated structured resource page."
+            )
+        return dict(parsed.structured_content)
 
     def _call_calendar_list_pilot(
         self,
@@ -547,9 +770,11 @@ class KeystoneClient:
     def _parse_response(message: Any, request_id: int) -> dict[str, Any]:
         """Validate a JSON-RPC result without exposing server-provided diagnostics."""
 
+        if type(request_id) is not int:
+            raise KeystoneProtocolError("Keystone request ID is malformed.")
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
             raise KeystoneProtocolError("Keystone response is not a JSON-RPC 2.0 object.")
-        if message.get("id") != request_id:
+        if type(message.get("id")) is not int or message["id"] != request_id:
             raise KeystoneProtocolError("Keystone response ID does not match the request.")
         if "error" in message:
             if not isinstance(message["error"], dict):

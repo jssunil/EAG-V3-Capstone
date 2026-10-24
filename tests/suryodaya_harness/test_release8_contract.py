@@ -66,13 +66,13 @@ def valid_document() -> dict[str, object]:
     }
 
 
-def test_hosted_configuration_targets_suryodaya_only() -> None:
+def test_hosted_configuration_targets_both_supported_instances() -> None:
     config = (ROOT / "agentswitch-harness.toml").read_text(encoding="utf-8")
 
     assert 'install = "pip install -e ."' in config
     assert 'run = "python -m harnesses.suryodaya_harness.hosted_runner"' in config
     assert 'results = "results.json"' in config
-    assert 'instances = ["suryodaya"]' in config
+    assert 'instances = ["suryodaya", "keystone"]' in config
     assert "timeout_minutes = 20" in config
 
 

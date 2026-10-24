@@ -82,6 +82,25 @@ def test_structured_candidate_never_becomes_pagination_data_without_contract() -
     assert "not been verified" in (parsed.unresolved_contract or "")
 
 
+def test_hosted_opt_in_exposes_only_schema_validated_structured_content() -> None:
+    page = _structured_page()
+    parsed = parse_mcp_tool_call_response(
+        _response({
+            "content": [{"type": "text", "text": "One record"}],
+            "structuredContent": page,
+        }),
+        7,
+        OUTPUT_SCHEMA,
+        expose_structured_content=True,
+    )
+
+    assert parsed.content_kind is McpContentKind.MIXED
+    assert parsed.structured_content == page
+    assert parsed.output_schema_validated
+    assert parsed.pagination_ready
+    assert parsed.unresolved_contract is None
+
+
 def test_text_only_result_is_not_parsed_as_resource_data() -> None:
     parsed = parse_mcp_tool_call_response(
         _response({"content": [{"type": "text", "text": "{\"data\":[]}"}]}),

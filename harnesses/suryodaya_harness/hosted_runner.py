@@ -25,13 +25,26 @@ from calendar_agent import (
 )
 from calendar_agent.models import ToolCallRecord
 from calendar_agent.tools import ReadOnlyCalendarTool
+from harnesses.keystone_harness import (
+    KeystoneCalendarAdapter,
+    KeystoneCalendarTool,
+    KeystoneClient,
+    KeystoneClientError,
+    KeystoneConfig,
+    KeystoneConfigurationError,
+    KeystoneGoalIntegrationError,
+    run_keystone_goal,
+)
+from harnesses.keystone_harness.authorization import RESOURCE_READ_OPERATIONS
 
 from .assertions import verify_result
 from .results import MAX_EVIDENCE_LENGTH, sanitize_evidence, validate_results
 from .server_runner import ServerRunnerError, write_results_atomic
 
 
-SURYOODAYA_INSTANCE = "suryodaya"
+SURYODAYA_INSTANCE = "suryodaya"
+KEYSTONE_INSTANCE = "keystone"
+SUPPORTED_INSTANCES = frozenset({SURYODAYA_INSTANCE, KEYSTONE_INSTANCE})
 GOAL_ONE = "calendar.find_30_minutes"
 GOAL_ONE_TITLE = "Find 30 minutes with the plant head"
 GOAL_TWO = "calendar.move_after_audit"
@@ -39,7 +52,6 @@ GOAL_TWO_TITLE = "Move events after the confirmed press shop and welding audit"
 GOAL_TWO_AUDIT_NUMBER = "EVT-2026-00007"
 GOAL_TWO_AUDIT_TITLE = "Internal quality audit — press shop and welding"
 GOAL_TWO_DEFAULT_SHIFT = timedelta(minutes=30)
-GOAL_TWO_TIMESTAMP_FALLBACK = "Asia/Kolkata"
 _SEARCH_WINDOW = timedelta(days=14)
 
 
@@ -104,8 +116,10 @@ def load_hosted_environment(values: Mapping[str, object]) -> HostedEnvironment:
         raise HostedConfigurationError("AGENTSWITCH_TOKEN must be set.")
 
     instance = instance_value.strip().casefold()
-    if instance != SURYOODAYA_INSTANCE:
-        raise HostedConfigurationError("Only the Suryodaya harness target is enabled.")
+    if instance not in SUPPORTED_INSTANCES:
+        raise HostedConfigurationError(
+            "AGENTSWITCH_INSTANCE must select Suryodaya or Keystone."
+        )
 
     base_url = base_url_value.strip()
     if any(character.isspace() or ord(character) < 32 for character in base_url):
@@ -115,13 +129,13 @@ def load_hosted_environment(values: Mapping[str, object]) -> HostedEnvironment:
         supplied.port
     except ValueError:
         raise HostedConfigurationError("AGENTSWITCH_BASE_URL is malformed.") from None
-    if supplied.scheme.casefold() != "https" or not supplied.hostname:
+    if supplied.scheme.casefold() not in {"http", "https"} or not supplied.hostname:
         raise HostedConfigurationError(
-            "AGENTSWITCH_BASE_URL must be an absolute HTTPS instance base URL."
+            "AGENTSWITCH_BASE_URL must be an absolute HTTP(S) instance base URL."
         )
     if supplied.username is not None or supplied.password is not None:
         raise HostedConfigurationError(
-            "AGENTSWITCH_BASE_URL must be a credential-free HTTPS instance base URL."
+            "AGENTSWITCH_BASE_URL must be a credential-free HTTP(S) instance base URL."
         )
     if supplied.query or supplied.fragment:
         raise HostedConfigurationError("AGENTSWITCH_BASE_URL must not contain a query or fragment.")
@@ -227,7 +241,7 @@ def check_suryodaya_goal_two(
             "audit_number": GOAL_TWO_AUDIT_NUMBER,
             "audit_title": GOAL_TWO_AUDIT_TITLE,
             "shift": GOAL_TWO_DEFAULT_SHIFT,
-            "naive_timestamp_timezone": GOAL_TWO_TIMESTAMP_FALLBACK,
+            "use_calendar_timezone_fallback": True,
         },
     )
     try:
@@ -316,13 +330,210 @@ def check_suryodaya_goal_two(
     )
 
 
+def check_keystone_goal_one(
+    adapter: KeystoneCalendarAdapter,
+    *,
+    now: datetime | None = None,
+    secret_values: tuple[str, ...] = (),
+) -> HostedCheck:
+    """Run the Keystone planner, but do not claim an unavailable goal predicate."""
+
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    current = current.astimezone(timezone.utc).replace(microsecond=0)
+    result = run_keystone_goal(
+        AgentTask(
+            GOAL_ONE,
+            GOAL_ONE_TITLE,
+            {
+                "now": current,
+                "start": current,
+                "end": current + _SEARCH_WINDOW,
+            },
+        ),
+        adapter,
+    )
+    evidence = (
+        "UNEVALUATED: Keystone Goal 1 planner "
+        f"status={result.status.value}; candidate_slots={len(result.candidate_slots)}; "
+        f"clarifications={len(result.ambiguities)}; "
+        f"{_read_trace_summary(result.tool_calls)}; "
+        "no authoritative business-goal predicate is available; "
+        "the Keystone allowlist does not provide scheduling preferences, "
+        "availability rules, or free/busy."
+    )
+    return _task(
+        task_id="keystone.goal1_read_only_candidate",
+        title="Keystone read-only Goal 1 candidate check",
+        passed=False,
+        evidence=evidence,
+        secret_values=secret_values,
+    )
+
+
+def check_keystone_goal_two(
+    adapter: KeystoneCalendarAdapter,
+    *,
+    secret_values: tuple[str, ...] = (),
+) -> HostedCheck:
+    """Verify one uniquely discoverable audit plan without executing mutations."""
+
+    discovery_tools = KeystoneCalendarTool(adapter)
+    try:
+        audit_events = discovery_tools.list_events(
+            filters={"search": "audit"},
+            limit=1000,
+        )
+    except KeystoneGoalIntegrationError as exc:
+        return _task(
+            task_id="keystone.goal2_read_only_plan",
+            title="Keystone read-only Goal 2 plan",
+            passed=False,
+            evidence=(
+                "UNEVALUATED: audit discovery stopped "
+                f"({exc.category}); {_read_trace_summary(discovery_tools.trace)}."
+            ),
+            secret_values=secret_values,
+        )
+
+    audit_candidates = [
+        event
+        for event in audit_events
+        if "audit"
+        in " ".join(
+            str(event.get(field) or "")
+            for field in ("title", "description")
+        ).casefold()
+    ]
+    if len(audit_candidates) != 1:
+        return _task(
+            task_id="keystone.goal2_read_only_plan",
+            title="Keystone read-only Goal 2 plan",
+            passed=False,
+            evidence=(
+                "UNEVALUATED: Keystone audit search did not resolve exactly one "
+                f"candidate (found={len(audit_candidates)}); "
+                f"{_read_trace_summary(discovery_tools.trace)}."
+            ),
+            secret_values=secret_values,
+        )
+
+    audit_id = audit_candidates[0].get("id")
+    calendar_id = audit_candidates[0].get("calendar_id")
+    if (
+        not isinstance(audit_id, str)
+        or not audit_id.strip()
+        or not isinstance(calendar_id, str)
+        or not calendar_id.strip()
+    ):
+        return _task(
+            task_id="keystone.goal2_read_only_plan",
+            title="Keystone read-only Goal 2 plan",
+            passed=False,
+            evidence=(
+                "UNEVALUATED: the unique Keystone audit candidate has no validated "
+                f"identity or owning calendar; {_read_trace_summary(discovery_tools.trace)}."
+            ),
+            secret_values=secret_values,
+        )
+    audit_status = audit_candidates[0].get("status")
+    if not isinstance(audit_status, str) or audit_status.strip().casefold() != "confirmed":
+        return _task(
+            task_id="keystone.goal2_read_only_plan",
+            title="Keystone read-only Goal 2 plan",
+            passed=False,
+            evidence=(
+                "UNEVALUATED: the unique Keystone audit candidate is not "
+                f"verified as confirmed; {_read_trace_summary(discovery_tools.trace)}."
+            ),
+            secret_values=secret_values,
+        )
+
+    result = run_keystone_goal(
+        AgentTask(
+            GOAL_TWO,
+            "Move everything after the audit",
+            {"calendar_id": calendar_id},
+        ),
+        adapter,
+    )
+    trace = [*discovery_tools.trace, *result.tool_calls]
+    trace_summary = _read_trace_summary(trace)
+    if result.status is not ResultStatus.PLANNED:
+        return _task(
+            task_id="keystone.goal2_read_only_plan",
+            title="Keystone read-only Goal 2 plan",
+            passed=False,
+            evidence=(
+                f"Keystone Goal 2 did not produce a plan ({result.status.value}); "
+                f"moves=0; clarifications={len(result.ambiguities)}; {trace_summary}."
+            ),
+            secret_values=secret_values,
+        )
+
+    verification = verify_result(result, expected_status=ResultStatus.PLANNED)
+    reference = result.audit_reference
+    exact_calendar = (
+        reference is not None
+        and len(reference.candidates) == 1
+        and reference.candidates[0].id == audit_id
+        and reference.candidates[0].calendar_id == calendar_id
+        and isinstance(reference.candidates[0].status, str)
+        and reference.candidates[0].status.casefold() == "confirmed"
+    )
+    outcome = result.claimed_outcome
+    confirmation_required = (
+        isinstance(outcome, dict)
+        and outcome.get("confirmation_required") is True
+        and isinstance(outcome.get("confirmation_prompt"), str)
+        and bool(outcome["confirmation_prompt"].strip())
+    )
+    mutation_free = not any(call.mutating for call in result.tool_calls)
+    move_summary = ";".join(
+        f"{move.event_id}:{move.proposed_start_at}>{move.proposed_end_at}"
+        for move in result.rescheduling_plan
+    )
+    evidence = (
+        f"calendar_resolved={str(exact_calendar).lower()};"
+        f"moves={len(result.rescheduling_plan)};"
+        f"shift=30m;"
+        f"confirmation_required={str(confirmation_required).lower()};"
+        f"mutation_attempts={sum(call.mutating for call in trace)};"
+        f"plan={move_summary};{trace_summary}"
+    )
+    passed = (
+        verification.passed
+        and exact_calendar
+        and confirmation_required
+        and isinstance(outcome, dict)
+        and outcome.get("moved") is False
+        and outcome.get("shift") == GOAL_TWO_DEFAULT_SHIFT
+        and mutation_free
+        and bool(result.rescheduling_plan)
+    )
+    if len(evidence) > MAX_EVIDENCE_LENGTH:
+        passed = False
+        evidence = (
+            "UNEVALUATED: Keystone Goal 2 plan is too large to fit the results "
+            "evidence limit; a complete plan was not serialized."
+        )
+    return _task(
+        task_id="keystone.goal2_read_only_plan",
+        title="Keystone read-only Goal 2 plan",
+        passed=passed,
+        evidence=evidence,
+        secret_values=secret_values,
+    )
+
+
 def run_hosted(
     environment: Mapping[str, object],
     *,
     output_path: str | Path,
     now: datetime | None = None,
 ) -> tuple[Path, tuple[HostedCheck, ...]]:
-    """Run the single platform-selected instance and write its result document."""
+    """Run the platform-selected instance and write its result document."""
 
     raw_token = environment.get("AGENTSWITCH_TOKEN")
     secret_values = (raw_token.strip(),) if isinstance(raw_token, str) and raw_token.strip() else ()
@@ -343,7 +554,7 @@ def run_hosted(
             "goal_tasks_not_run=true; official_evaluator=not_invoked."
         )
     else:
-        if config.instance == SURYOODAYA_INSTANCE:
+        if config.instance == SURYODAYA_INSTANCE:
             try:
                 client_config = AgentSwitchConfig(base_url=config.base_url, token=config.token)
                 tools = AgentSwitchCalendarTools(AgentSwitchClient(client_config))
@@ -371,8 +582,83 @@ def run_hosted(
                         secret_values=secret_values,
                     ),
                 )
+        elif config.instance == KEYSTONE_INSTANCE:
+            try:
+                keystone_config = KeystoneConfig.for_hosted_runner(
+                    base_url=config.base_url,
+                    token=config.token,
+                )
+                client = KeystoneClient(
+                    keystone_config,
+                    enable_hosted_read_transport=True,
+                )
+                discovery = client.list_tools()
+                available_operations = {tool.name for tool in discovery.tools}
+                missing_operations = sorted(
+                    RESOURCE_READ_OPERATIONS - available_operations
+                )
+                connection_check = _task(
+                    task_id="keystone.mcp_tools_list",
+                    title="Keystone MCP tools/list and read tools",
+                    passed=not missing_operations,
+                    evidence=(
+                        f"discovered_tools={len(discovery.tools)};"
+                        f"required_read_tools_missing={','.join(missing_operations) or 'none'}."
+                    ),
+                    secret_values=secret_values,
+                )
+                adapter = KeystoneCalendarAdapter(client)
+                if missing_operations:
+                    goal_checks = (
+                        _task(
+                            task_id="keystone.goal1_read_only_candidate",
+                            title="Keystone read-only Goal 1 candidate check",
+                            passed=False,
+                            evidence=(
+                                "UNEVALUATED: required Keystone read tools were not "
+                                "all discovered; no goal calls were made."
+                            ),
+                            secret_values=secret_values,
+                        ),
+                        _task(
+                            task_id="keystone.goal2_read_only_plan",
+                            title="Keystone read-only Goal 2 plan",
+                            passed=False,
+                            evidence=(
+                                "UNEVALUATED: required Keystone read tools were not "
+                                "all discovered; no goal calls were made."
+                            ),
+                            secret_values=secret_values,
+                        ),
+                    )
+                else:
+                    goal_checks = (
+                        check_keystone_goal_one(
+                            adapter,
+                            now=now,
+                            secret_values=secret_values,
+                        ),
+                        check_keystone_goal_two(
+                            adapter,
+                            secret_values=secret_values,
+                        ),
+                    )
+                tasks = (connection_check, *goal_checks)
+            except (KeystoneClientError, KeystoneConfigurationError) as exc:
+                tasks = (
+                    _task(
+                        task_id="harness.execution",
+                        title="Keystone harness execution",
+                        passed=False,
+                        evidence=(
+                            "UNEVALUATED: Keystone harness initialization or evaluation "
+                            f"stopped ({type(exc).__name__})."
+                        ),
+                        secret_values=secret_values,
+                    ),
+                )
         else:
-            raise AssertionError("load_hosted_environment must reject non-Suryodaya instances")
+            raise AssertionError("load_hosted_environment must reject unsupported instances")
         passed_count = sum(task.passed for task in tasks)
         summary = (
             f"{config.instance}: {passed_count}/{len(tasks)} harness checks passed; "
@@ -404,7 +690,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Hosted harness wrote {output_path}; harness_checks_passed="
         f"{passed_count}/{len(tasks)}; official_evaluator=not_invoked."
     )
-    return 0
+    return 0 if all(task.passed for task in tasks) else 1
 
 
 if __name__ == "__main__":

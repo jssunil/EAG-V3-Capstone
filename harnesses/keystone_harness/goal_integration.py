@@ -352,7 +352,20 @@ class KeystoneCalendarTool:
         raise error
 
     def get_calendar(self, calendar_id: str) -> dict[str, Any]:
-        self._unavailable("Calendar.get", {"id": calendar_id})
+        calendars = self.list_calendars(
+            filters={"id": calendar_id},
+            limit=1000,
+        )
+        matches = [calendar for calendar in calendars if calendar.get("id") == calendar_id]
+        if len(matches) != 1:
+            raise KeystoneIncompleteDataError(
+                "Calendar.list did not resolve exactly one owning calendar for timezone fallback."
+            )
+        if not isinstance(matches[0].get("timezone"), str):
+            raise KeystoneIncompleteDataError(
+                "The owning calendar has no verified IANA timezone for timestamp fallback."
+            )
+        return matches[0]
 
     def get_event(self, event_id: str) -> dict[str, Any]:
         self._unavailable("CalendarEvent.get", {"id": event_id})
@@ -413,6 +426,10 @@ def run_keystone_goal(
 ) -> AgentResult:
     """Run an existing goal with only offline Keystone adapter data."""
 
+    if task.goal == "calendar.move_after_audit":
+        context = dict(task.context)
+        context["use_calendar_timezone_fallback"] = True
+        task = AgentTask(task.goal, task.instruction, context)
     tools = KeystoneCalendarTool(adapter)
     try:
         return CalendarAgent(tools).run(task)

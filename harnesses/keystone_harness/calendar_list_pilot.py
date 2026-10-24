@@ -36,15 +36,16 @@ class CalendarListSmokePilot:
     """Offline-only gate for one assumed Calendar.list request/response contract.
 
     The assumed success envelope is JSON-RPC 2.0 with only ``jsonrpc``, integer
-    ``id``, and ``result`` at the top level. The result requires an empty
-    ``content`` array and ``structuredContent`` with exactly ``data``, ``total``,
-    ``limit``, and ``offset``. Only optional ``isError: false`` and empty
-    ``_meta`` are accepted. An error envelope contains only ``jsonrpc``, ``id``,
-    and ``error``; ``error`` requires integer ``code`` and string ``message``,
-    with optional ``data``. The page must contain at most one record, a
-    nonnegative integer ``total`` no smaller than the returned row count, and
-    exact integer ``limit=1`` and ``offset=0``. Errors are failures, never
-    successful reads. This Keystone wire contract is unverified.
+    ``id``, and ``result`` at the top level. The result requires
+    ``structuredContent`` and a ``content`` array containing only well-formed
+    text blocks, which may be empty. Structured content has exactly ``data``,
+    ``total``, ``limit``, and ``offset``. Only optional ``isError: false`` and
+    empty ``_meta`` are accepted. An error envelope contains only ``jsonrpc``,
+    ``id``, and ``error``; ``error`` requires integer ``code`` and string
+    ``message``, with optional ``data``. The page must contain at most one
+    record, a nonnegative integer ``total`` no smaller than the returned row
+    count, and exact integer ``limit=1`` and ``offset=0``. Errors are failures,
+    never successful reads. This Keystone wire contract is unverified.
     """
 
     def __init__(self, client: KeystoneClient) -> None:

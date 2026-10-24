@@ -22,6 +22,9 @@ from harnesses.keystone_harness import (
     KeystoneToolError,
     PRODUCTION_READ_ONLY_OPERATIONS,
 )
+from harnesses.keystone_harness.calendar_list_transport import (
+    CalendarListPilotTransport,
+)
 
 
 SECRET = "keystone-test-secret-never-display"
@@ -57,8 +60,75 @@ class FakeSession:
         return self.response
 
 
+class SequencedSession:
+    def __init__(self, responses: list[FakeResponse]) -> None:
+        self.responses = responses
+        self.calls: list[dict[str, Any]] = []
+
+    def post(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.calls.append({"url": url, **kwargs})
+        if not self.responses:
+            raise AssertionError("unexpected transport invocation")
+        return self.responses.pop(0)
+
+
 def response(payload: object, *, request_id: int = 1) -> FakeResponse:
     return FakeResponse({"jsonrpc": "2.0", "id": request_id, "result": payload})
+
+
+def hosted_session_prefix() -> list[FakeResponse]:
+    return [
+        response(
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "serverInfo": {"name": "test-server", "version": "1"},
+            },
+            request_id=1,
+        ),
+        FakeResponse({}),
+        response(
+            {"tools": [_hosted_calendar_list_tool()], "nextCursor": None},
+            request_id=2,
+        ),
+    ]
+
+
+def _hosted_calendar_list_tool() -> dict[str, Any]:
+    return {
+        "name": "Calendar.list",
+        "description": "List calendars",
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string", "minLength": 1}},
+                        "required": ["id"],
+                        "additionalProperties": True,
+                    },
+                },
+                "total": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 0},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+            "required": ["data", "total", "limit", "offset"],
+            "additionalProperties": True,
+        },
+        "_meta": {"agentswitch": {"permission": "read", "risk": "READ"}},
+    }
 
 
 def test_default_keystone_origin_is_accepted() -> None:
@@ -66,6 +136,8 @@ def test_default_keystone_origin_is_accepted() -> None:
 
     assert config.base_url == DEFAULT_BASE_URL
     assert config.endpoint == f"{DEFAULT_BASE_URL}/api/mcp"
+    assert config.is_approved_pilot_origin
+    CalendarListPilotTransport(KeystoneClient(config))
 
 
 def test_hosted_runner_config_accepts_secure_platform_endpoint() -> None:
@@ -75,14 +147,27 @@ def test_hosted_runner_config_accepts_secure_platform_endpoint() -> None:
     )
 
     assert config.endpoint == "https://runner.example.test/tenant/keystone/api/mcp"
+    assert not config.is_approved_pilot_origin
+    with pytest.raises(KeystoneOperationNotAllowedError):
+        CalendarListPilotTransport(KeystoneClient(config))
     assert SECRET not in repr(config)
+
+    for base_url in (
+        "https://runner.example.test",
+        "https://class.agentswitch.theschoolofai.in:8443",
+    ):
+        runner_config = KeystoneConfig.for_hosted_runner(
+            base_url=base_url,
+            token=SECRET,
+        )
+        with pytest.raises(KeystoneOperationNotAllowedError):
+            CalendarListPilotTransport(KeystoneClient(runner_config))
 
 
 @pytest.mark.parametrize(
     "base_url",
     [
         "ftp://runner.example.test",
-        "http://runner.example.test",
         "https://user:password@runner.example.test",
         "https://runner.example.test?instance=keystone",
         "https://runner.example.test:99999",
@@ -91,6 +176,12 @@ def test_hosted_runner_config_accepts_secure_platform_endpoint() -> None:
 def test_hosted_runner_config_rejects_unsafe_endpoint(base_url: str) -> None:
     with pytest.raises(KeystoneConfigurationError):
         KeystoneConfig.for_hosted_runner(base_url=base_url, token=SECRET)
+    for invalid_url in (
+        "https://user:password@runner.example.test",
+        "https://runner.example.test#fragment",
+    ):
+        with pytest.raises(KeystoneConfigurationError):
+            KeystoneConfig.for_hosted_runner(base_url=invalid_url, token=SECRET)
 
 
 def test_hosted_runner_config_preserves_platform_https_host_path_and_port() -> None:
@@ -111,6 +202,16 @@ def test_hosted_runner_config_preserves_platform_service_port() -> None:
     assert config.endpoint == "https://runner.internal:8080/keystone/api/mcp"
 
 
+def test_hosted_runner_config_accepts_platform_http_url_without_rewriting_it() -> None:
+    config = KeystoneConfig.for_hosted_runner(
+        base_url="http://runner.internal:8000/tenant/keystone",
+        token=SECRET,
+    )
+
+    assert config.base_url == "http://runner.internal:8000/tenant/keystone"
+    assert config.endpoint == "http://runner.internal:8000/tenant/keystone/api/mcp"
+
+
 @pytest.mark.parametrize(
     "destination",
     [
@@ -129,12 +230,23 @@ def test_hosted_runner_config_preserves_platform_service_port() -> None:
 def test_invalid_or_non_keystone_destinations_are_rejected(destination: str) -> None:
     with pytest.raises(KeystoneConfigurationError):
         KeystoneConfig(base_url=destination)
+    try:
+        runner_config = KeystoneConfig.for_hosted_runner(
+            base_url=destination,
+            token=SECRET,
+        )
+    except KeystoneConfigurationError:
+        return
+
+    with pytest.raises(KeystoneOperationNotAllowedError):
+        CalendarListPilotTransport(KeystoneClient(runner_config))
 
 
 def test_standard_https_port_is_canonicalized_to_approved_origin() -> None:
     config = KeystoneConfig(base_url="https://class.agentswitch.theschoolofai.in:443/")
 
     assert config.base_url == DEFAULT_BASE_URL
+    assert config.is_approved_pilot_origin
 
 
 def test_configuration_does_not_fall_back_to_agentswitch_token(
@@ -187,6 +299,109 @@ def test_client_has_no_approved_transport_operation() -> None:
     assert session.calls == []
 
 
+def test_opted_in_hosted_client_returns_only_schema_validated_structured_content() -> None:
+    page = {"data": [{"id": "calendar-1"}], "total": 1, "limit": 1, "offset": 0}
+    session = SequencedSession([
+        *hosted_session_prefix(),
+        response(
+            {
+                "content": [{"type": "text", "text": "Calendar page"}],
+                "structuredContent": page,
+            },
+            request_id=3,
+        ),
+    ])
+    client = KeystoneClient(
+        KeystoneConfig.for_hosted_runner(
+            base_url="http://runner.internal:8000/keystone",
+            token=SECRET,
+        ),
+        session=session,  # type: ignore[arg-type]
+        enable_hosted_read_transport=True,
+    )
+    client.list_tools()
+    authorization = client.authorize_read_request(
+        "Calendar.list",
+        {"limit": 1, "offset": 0},
+    )
+
+    result = client.call_authorized_read(authorization)
+
+    assert result == page
+    call = session.calls[3]
+    assert call["allow_redirects"] is False
+    assert call["json"] == {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "Calendar.list",
+            "arguments": {"limit": 1, "offset": 0},
+        },
+    }
+
+
+def test_hosted_read_authorization_is_single_use() -> None:
+    page = {"data": [], "total": 0, "limit": 1, "offset": 0}
+    session = SequencedSession([
+        *hosted_session_prefix(),
+        response(
+            {"content": [], "structuredContent": page},
+            request_id=3,
+        ),
+    ])
+    client = KeystoneClient(
+        KeystoneConfig.for_hosted_runner(
+            base_url="https://runner.internal/keystone",
+            token=SECRET,
+        ),
+        session=session,  # type: ignore[arg-type]
+        enable_hosted_read_transport=True,
+    )
+    client.list_tools()
+    authorization = client.authorize_read_request(
+        "Calendar.list",
+        {"limit": 1, "offset": 0},
+    )
+    client.call_authorized_read(authorization)
+
+    with pytest.raises(KeystoneOperationNotAllowedError, match="only once"):
+        client.call_authorized_read(authorization)
+
+    assert len(session.calls) == 4
+
+
+def test_hosted_read_rejects_text_only_resource_data() -> None:
+    session = SequencedSession([
+        *hosted_session_prefix(),
+        response(
+            {
+                "content": [{
+                    "type": "text",
+                    "text": '{"data":[],"total":0,"limit":1,"offset":0}',
+                }],
+            },
+            request_id=3,
+        ),
+    ])
+    client = KeystoneClient(
+        KeystoneConfig.for_hosted_runner(
+            base_url="https://runner.internal/keystone",
+            token=SECRET,
+        ),
+        session=session,  # type: ignore[arg-type]
+        enable_hosted_read_transport=True,
+    )
+    client.list_tools()
+    authorization = client.authorize_read_request(
+        "Calendar.list",
+        {"limit": 1, "offset": 0},
+    )
+
+    with pytest.raises(KeystoneProtocolError, match="validated structured resource page"):
+        client.call_authorized_read(authorization)
+
+
 @pytest.mark.parametrize("operation", ["tools/list", "CalendarEvent.create", "anything"])
 def test_unapproved_operations_fail_before_transport(operation: str) -> None:
     session = FakeSession()
@@ -221,6 +436,12 @@ def test_response_parser_accepts_a_valid_json_rpc_result() -> None:
         {"jsonrpc": "2.0", "id": 7, "result": {"read_only": True}},
         7,
     ) == {"read_only": True}
+    for malformed_request_id in (True, 1.0):
+        with pytest.raises(KeystoneProtocolError, match="request ID"):
+            KeystoneClient._parse_response(
+                {"jsonrpc": "2.0", "id": 1, "result": {}},
+                malformed_request_id,  # type: ignore[arg-type]
+            )
 
 
 def test_list_tools_performs_only_protocol_discovery() -> None:
@@ -411,12 +632,45 @@ def test_list_tools_rejects_duplicate_names() -> None:
         session=FakeSession(response({
             "tools": [
                 {"name": "Party.list", "annotations": {}, "inputSchema": {}},
-                {"name": " Party.list ", "annotations": {}, "inputSchema": {}},
+                {"name": "Party.list", "annotations": {}, "inputSchema": {}},
             ],
         })),
     )  # type: ignore[arg-type]
 
     with pytest.raises(KeystoneProtocolError, match="duplicate tool names"):
+        client.list_tools()
+    for padded_name in (" Party.list", "Party.list ", "\tParty.list"):
+        padded_client = KeystoneClient(
+            KeystoneConfig(token=SECRET),
+            session=FakeSession(response({
+                "tools": [{
+                    "name": padded_name,
+                    "annotations": {},
+                    "inputSchema": {},
+                }],
+            })),
+        )  # type: ignore[arg-type]
+        with pytest.raises(KeystoneProtocolError, match="malformed tool metadata"):
+            padded_client.list_tools()
+
+
+@pytest.mark.parametrize(
+    "response_id",
+    [True, False, 1.0, "1", None, 2],
+)
+def test_list_tools_rejects_non_integer_response_ids(
+    response_id: object,
+) -> None:
+    client = KeystoneClient(
+        KeystoneConfig(token=SECRET),
+        session=FakeSession(FakeResponse({
+            "jsonrpc": "2.0",
+            "id": response_id,
+            "result": {"tools": []},
+        })),
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(KeystoneProtocolError, match="ID"):
         client.list_tools()
 
 

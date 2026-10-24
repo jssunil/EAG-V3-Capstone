@@ -18,7 +18,7 @@ class KeystoneConfigurationError(ValueError):
 
 
 def _validated_runner_base_url(value: object) -> str:
-    """Validate a platform-injected HTTPS base URL for discovery-only runner use."""
+    """Validate the platform-injected instance URL without substituting an origin."""
 
     if not isinstance(value, str) or not value or value != value.strip():
         raise KeystoneConfigurationError("AGENTSWITCH_BASE_URL must be a valid HTTPS URL.")
@@ -32,10 +32,16 @@ def _validated_runner_base_url(value: object) -> str:
         port = parsed.port
     except ValueError:
         raise KeystoneConfigurationError("AGENTSWITCH_BASE_URL is malformed.") from None
-    if parsed.scheme.lower() != "https" or not parsed.hostname:
-        raise KeystoneConfigurationError("AGENTSWITCH_BASE_URL must use HTTPS and include a host.")
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise KeystoneConfigurationError(
+            "AGENTSWITCH_BASE_URL must be an absolute HTTP(S) URL with a host."
+        )
     if parsed.username is not None or parsed.password is not None:
         raise KeystoneConfigurationError("AGENTSWITCH_BASE_URL must not contain URL credentials.")
+    if parsed.path.rstrip("/").casefold().endswith("/api/mcp"):
+        raise KeystoneConfigurationError(
+            "AGENTSWITCH_BASE_URL must be the instance base URL, not the /api/mcp endpoint."
+        )
     return value.rstrip("/")
 
 
@@ -144,6 +150,18 @@ class KeystoneConfig:
     @property
     def endpoint(self) -> str:
         return f"{self.base_url}/api/mcp"
+
+    @property
+    def is_approved_pilot_origin(self) -> bool:
+        return (
+            not self._hosted_runner_origin
+            and self.base_url == DEFAULT_BASE_URL
+            and self.endpoint == f"{DEFAULT_BASE_URL}/api/mcp"
+        )
+
+    @property
+    def is_hosted_runner_config(self) -> bool:
+        return self._hosted_runner_origin
 
     @property
     def timeout(self) -> tuple[float, float]:

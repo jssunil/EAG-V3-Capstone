@@ -33,6 +33,7 @@ _FILTER_PROPERTIES: dict[str, dict[str, Any]] = {
         },
     },
     "Calendar.list": {
+        "id": {"type": "string", "minLength": 1},
         "owner_party_id": {"type": "string"},
         "timezone": {"type": "string"},
         "type": {
@@ -475,6 +476,27 @@ def test_authorization_is_bound_to_the_discovery_made_by_the_same_client() -> No
     assert isinstance(authorization, KeystoneReadAuthorization)
     assert client.validate_read_authorization(authorization) is discovery.tools[0]
     assert session.methods == ["tools/list"]
+
+
+def test_client_can_authorize_from_unknown_catalog_completeness() -> None:
+    class CursorlessToolsListSession(SyntheticToolsListSession):
+        def post(self, url: str, **kwargs: Any) -> SyntheticToolsListResponse:
+            result = super().post(url, **kwargs)
+            result.payload["result"].pop("nextCursor")
+            return result
+
+    client = KeystoneClient(
+        KeystoneConfig(token="offline-policy-test-token"),
+        session=CursorlessToolsListSession((_tool("Party.list"),)),
+    )  # type: ignore[arg-type]
+    discovery = client.list_tools()
+
+    assert discovery.completeness.status is CompletenessStatus.UNKNOWN
+    authorization = client.authorize_read_request(
+        "Party.list",
+        {"limit": 1, "offset": 0},
+    )
+    assert client.validate_read_authorization(authorization).name == "Party.list"
 
 
 def test_fabricated_or_unrelated_discovery_cannot_create_client_authorization() -> None:
