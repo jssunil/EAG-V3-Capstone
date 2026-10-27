@@ -9,14 +9,20 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Protocol, Sequence
+from urllib.parse import urlsplit
 
 from .agentswitch_client import (
+    AgentSwitchError,
     AgentSwitchAuthenticationError,
     AgentSwitchBudgetExhaustedError,
     AgentSwitchClient,
-    AgentSwitchError,
 )
-from .models import CalendarEventPage, MutationDisabledError, ToolCallRecord
+from .models import (
+    CalendarEventPage,
+    CalendarMutationError,
+    MutationDisabledError,
+    ToolCallRecord,
+)
 
 
 _MAX_EVENT_PAGE_SIZE = 1000
@@ -72,6 +78,10 @@ class ReadOnlyCalendarTool:
 
     def __init__(self, delegate: CalendarTool) -> None:
         self._delegate = delegate
+
+    @property
+    def disposable_mutations_enabled(self) -> bool:
+        return False
 
     @property
     def trace(self) -> list[ToolCallRecord]:
@@ -153,9 +163,30 @@ class ReadOnlyCalendarTool:
 class AgentSwitchCalendarTools:
     """Translate typed calendar operations into MCP tool calls."""
 
-    def __init__(self, client: AgentSwitchClient) -> None:
+    def __init__(
+        self,
+        client: AgentSwitchClient,
+        *,
+        enable_disposable_mutations: bool = False,
+    ) -> None:
+        if type(enable_disposable_mutations) is not bool:
+            raise TypeError("enable_disposable_mutations must be a boolean")
+        if enable_disposable_mutations:
+            hostname = urlsplit(client.config.base_url).hostname
+            if hostname in {
+                "agentswitch.theschoolofai.in",
+                "class.agentswitch.theschoolofai.in",
+            }:
+                raise MutationDisabledError(
+                    "Calendar mutations are disabled for shared live AgentSwitch origins."
+                )
         self._client = client
+        self._disposable_mutations_enabled = enable_disposable_mutations
         self.trace: list[ToolCallRecord] = []
+
+    @property
+    def disposable_mutations_enabled(self) -> bool:
+        return self._disposable_mutations_enabled
 
     def _read(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -273,13 +304,55 @@ class AgentSwitchCalendarTools:
         self.trace.append(ToolCallRecord(tool, arguments, mutating=True, succeeded=False, error="disabled"))
         raise MutationDisabledError(f"Mutation tool disabled: {tool}")
 
+    def _write(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if not self._disposable_mutations_enabled:
+            self._mutation_disabled(tool, arguments)
+        try:
+            result = self._client.call_tool(tool, arguments)
+        except AgentSwitchError as exc:
+            self.trace.append(
+                ToolCallRecord(
+                    tool,
+                    arguments,
+                    mutating=True,
+                    succeeded=False,
+                    error=type(exc).__name__,
+                )
+            )
+            raise CalendarMutationError(
+                f"{tool} request failed; verify state before retrying."
+            ) from exc
+        structured = result.get("structuredContent")
+        if not isinstance(structured, dict) or not isinstance(structured.get("id"), str):
+            self.trace.append(
+                ToolCallRecord(
+                    tool,
+                    arguments,
+                    mutating=True,
+                    succeeded=False,
+                    error="unverified_response",
+                )
+            )
+            raise CalendarMutationError(
+                f"{tool} returned no verifiable event ID; re-read state before retrying."
+            )
+        self.trace.append(ToolCallRecord(tool, arguments, mutating=True))
+        return structured
+
     def create_event(self, **arguments: Any) -> dict[str, Any]:
-        self._mutation_disabled("CalendarEvent.create", arguments)
-        return {}
+        required = {"calendar_id", "title", "start_at", "end_at"}
+        if not required.issubset(arguments):
+            raise ValueError("CalendarEvent.create requires calendar_id, title, start_at, and end_at.")
+        return self._write("CalendarEvent.create", arguments)
 
     def update_event(self, **arguments: Any) -> dict[str, Any]:
-        self._mutation_disabled("CalendarEvent.update", arguments)
-        return {}
+        if not self._disposable_mutations_enabled:
+            self._mutation_disabled("CalendarEvent.update", arguments)
+        if set(arguments) - {"id", "start_at", "end_at"}:
+            raise ValueError("CalendarEvent.update accepts only ID and scheduled start/end fields.")
+        if not {"id", "start_at", "end_at"}.issubset(arguments):
+            raise ValueError("CalendarEvent.update requires ID, start_at, and end_at.")
+        return self._write("CalendarEvent.update", arguments)
 
     def delete_event(self, event_id: str) -> dict[str, Any]:
         self._mutation_disabled("CalendarEvent.delete", {"id": event_id})

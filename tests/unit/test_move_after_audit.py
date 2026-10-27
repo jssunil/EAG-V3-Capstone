@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 import calendar_agent.goals.move_after_audit as move_after_audit
 from calendar_agent.agent import CalendarAgent
-from calendar_agent.models import AgentResult, AgentTask, CalendarEventPage, ResultStatus
+from calendar_agent.models import (
+    AgentResult,
+    AgentTask,
+    CalendarEventPage,
+    CalendarMutationError,
+    ResultStatus,
+)
 from calendar_agent.tools import CalendarEventListError
 from harnesses.suryodaya_harness.assertions import verify_rescheduling_plan, verify_result
 
@@ -102,6 +109,43 @@ class ScriptedEventPages(FakeCalendarTools):
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class WritableFakeCalendarTools(FakeCalendarTools):
+    disposable_mutations_enabled = True
+
+    def __init__(
+        self,
+        *,
+        events: list[dict[str, object]],
+        fail_update_at: int | None = None,
+        mutate_unplanned_event: bool = False,
+    ) -> None:
+        super().__init__(events=events)
+        self.fail_update_at = fail_update_at
+        self.mutate_unplanned_event = mutate_unplanned_event
+        self.update_attempts = 0
+
+    def list_events_page(self, **filters: object) -> CalendarEventPage:
+        page_result = super().list_events_page(**filters)
+        return CalendarEventPage(
+            records=tuple(deepcopy(record) for record in page_result.records),
+            total=page_result.total,
+            limit=page_result.limit,
+            offset=page_result.offset,
+        )
+
+    def update_event(self, **arguments: object) -> dict[str, object]:
+        self.update_attempts += 1
+        if self.update_attempts == self.fail_update_at:
+            raise CalendarMutationError("synthetic update failure")
+        event_id = arguments["id"]
+        target = next(record for record in self.events if record.get("id") == event_id)
+        target["start_at"] = arguments["start_at"]
+        target["end_at"] = arguments["end_at"]
+        if self.mutate_unplanned_event:
+            self.events[1]["title"] = "Changed unexpectedly"
+        return {"id": event_id}
 
 
 def page(
@@ -790,6 +834,57 @@ def test_naive_suryodaya_timestamps_use_explicit_kolkata_fallback() -> None:
     assert result.audit_reference.candidates[0].start_at == "2026-09-19T09:30:00+05:30"
     assert result.claimed_outcome["moved"] is False
     assert result.claimed_outcome["confirmation_required"] is True
+
+
+def test_confirm_move_stops_on_partial_update_and_reports_attempt_count() -> None:
+    events = [
+        AUDIT.copy(),
+        event("after-1", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
+        event("after-2", "2026-09-22T13:00:00+00:00", "2026-09-22T14:00:00+00:00"),
+    ]
+    tools = WritableFakeCalendarTools(events=events, fail_update_at=2)
+    agent = CalendarAgent(tools, allow_disposable_writes=True)
+    task = AgentTask(
+        "calendar.move_after_audit",
+        "Move everything after the audit",
+        {"calendar_id": "calendar-1", "shift": SHIFT},
+    )
+    proposal = agent.run(task)
+
+    result = agent.confirm_move(task, proposal, "Confirm 1 hour")
+
+    assert proposal.status is ResultStatus.PLANNED
+    assert result.status is ResultStatus.FAILED
+    assert tools.update_attempts == 2
+    assert result.claimed_outcome["updates_attempted"] == 2
+    assert result.claimed_outcome["updates_completed"] == 1
+    assert "partial test changes" in result.summary
+    assert "before any retry" in result.summary
+
+
+def test_confirm_move_detects_non_target_metadata_changes() -> None:
+    events = [
+        AUDIT.copy(),
+        event("before", "2026-09-22T08:00:00+00:00", "2026-09-22T09:00:00+00:00"),
+        event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
+    ]
+    tools = WritableFakeCalendarTools(
+        events=events,
+        mutate_unplanned_event=True,
+    )
+    agent = CalendarAgent(tools, allow_disposable_writes=True)
+    task = AgentTask(
+        "calendar.move_after_audit",
+        "Move everything after the audit",
+        {"calendar_id": "calendar-1", "shift": SHIFT},
+    )
+    proposal = agent.run(task)
+
+    result = agent.confirm_move(task, proposal, "Confirm 1 hour")
+
+    assert proposal.status is ResultStatus.PLANNED
+    assert result.status is ResultStatus.FAILED
+    assert "outside the confirmed move set changed" in result.summary
 
 
 def test_missing_or_invalid_timezone_fails_closed() -> None:

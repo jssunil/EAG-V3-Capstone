@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from calendar_agent.models import AgentTask, MutationDisabledError, ResultStatus
+import harnesses.suryodaya_harness.hosted_runner as hosted_runner
 from harnesses.keystone_harness import (
     DiscoveredTool,
     KeystoneCalendarAdapter,
@@ -18,9 +19,11 @@ from harnesses.keystone_harness import (
     run_keystone_goal,
 )
 from harnesses.suryodaya_harness.hosted_runner import (
+    GOAL_TWO_AUDIT_TITLE,
     check_keystone_goal_one,
     check_keystone_goal_two,
 )
+from harnesses.suryodaya_harness.journal import HostedRunJournal
 from harnesses.keystone_harness.goal_integration import KeystoneCalendarTool
 
 
@@ -450,9 +453,15 @@ def test_hosted_keystone_goal_two_requires_confirmation_and_never_mutates() -> N
     events = [
         _event(
             "audit-1",
-            "Internal quality audit",
+            GOAL_TWO_AUDIT_TITLE,
             "2026-09-22T09:00:00+00:00",
             "2026-09-22T10:00:00+00:00",
+        ),
+        _event(
+            "other-audit",
+            "Supplier audit",
+            "2026-09-22T07:00:00+00:00",
+            "2026-09-22T08:00:00+00:00",
         ),
         _event(
             "after-1",
@@ -462,7 +471,7 @@ def test_hosted_keystone_goal_two_requires_confirmation_and_never_mutates() -> N
         ),
     ]
     adapter, _ = _adapter({
-        ("CalendarEvent.list", 0): _page(events, total=2),
+        ("CalendarEvent.list", 0): _page(events, total=3),
     })
 
     check = check_keystone_goal_two(adapter)
@@ -473,17 +482,17 @@ def test_hosted_keystone_goal_two_requires_confirmation_and_never_mutates() -> N
     assert "mutation_attempts=0" in check.evidence
 
 
-def test_hosted_keystone_goal_two_refuses_ambiguous_audits() -> None:
+def test_hosted_keystone_goal_two_refuses_duplicate_exact_mirror_audits() -> None:
     events = [
         _event(
             "audit-1",
-            "Internal quality audit",
+            GOAL_TWO_AUDIT_TITLE,
             "2026-09-22T09:00:00+00:00",
             "2026-09-22T10:00:00+00:00",
         ),
         _event(
             "audit-2",
-            "Supplier audit",
+            GOAL_TWO_AUDIT_TITLE,
             "2026-09-22T13:00:00+00:00",
             "2026-09-22T14:00:00+00:00",
         ),
@@ -501,7 +510,7 @@ def test_hosted_keystone_goal_two_refuses_ambiguous_audits() -> None:
 def test_hosted_keystone_goal_two_requires_confirmed_audit() -> None:
     audit = _event(
         "audit-1",
-        "Internal quality audit",
+        GOAL_TWO_AUDIT_TITLE,
         "2026-09-22T09:00:00+00:00",
         "2026-09-22T10:00:00+00:00",
     )
@@ -514,6 +523,55 @@ def test_hosted_keystone_goal_two_requires_confirmed_audit() -> None:
 
     assert not check.passed
     assert "not verified as confirmed" in check.evidence
+
+
+def test_hosted_keystone_goal_two_journals_backend_reads_before_predicate(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    events = [
+        _event(
+            "audit-1",
+            GOAL_TWO_AUDIT_TITLE,
+            "2026-09-22T09:00:00+00:00",
+            "2026-09-22T10:00:00+00:00",
+        ),
+        _event(
+            "after-1",
+            "Production review",
+            "2026-09-22T11:00:00+00:00",
+            "2026-09-22T12:00:00+00:00",
+        ),
+    ]
+    adapter, _ = _adapter({
+        ("CalendarEvent.list", 0): _page(events, total=2),
+    })
+    journal = HostedRunJournal(
+        tmp_path,
+        instance="keystone",
+        run_id="before-score",
+    )
+    task_id = "keystone.goal2_read_only_plan"
+    journal.begin(
+        task_id=task_id,
+        title="Keystone read-only Goal 2 plan",
+        goal="calendar.move_after_audit",
+    )
+    original_verify = hosted_runner.verify_result
+
+    def verify_after_journal(result, *, expected_status):
+        record = journal._load(task_id)
+        assert record["phase"] == "execution_recorded"
+        assert record["observation"]["exact_title_match_count"] == 1
+        assert record["agent_result"]["status"] == "planned"
+        return original_verify(result, expected_status=expected_status)
+
+    monkeypatch.setattr(hosted_runner, "verify_result", verify_after_journal)
+
+    check = check_keystone_goal_two(adapter, journal=journal)
+
+    assert check.passed
+    journal.finish(check)
 
 
 def test_move_goal_uses_the_matching_calendars_timezone_for_naive_timestamps() -> None:

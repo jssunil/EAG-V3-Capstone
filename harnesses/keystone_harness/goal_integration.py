@@ -13,6 +13,7 @@ from calendar_agent.models import (
     AgentTask,
     CalendarEventPage,
     CalendarEventRef,
+    CalendarMutationError,
     EventAttendee,
     MutationDisabledError,
     PartyRecord,
@@ -70,7 +71,7 @@ _T = TypeVar("_T")
 
 
 class KeystoneCalendarTool:
-    """CalendarTool-shaped facade over the existing four-read adapter."""
+    """CalendarTool facade with disabled-by-default disposable mutations."""
 
     _MISSING_FIND_CAPABILITIES = (
         "SchedulingPreferences.list",
@@ -78,11 +79,26 @@ class KeystoneCalendarTool:
         "endpoint.calendar.free_busy",
     )
 
-    def __init__(self, adapter: KeystoneCalendarAdapter) -> None:
+    def __init__(
+        self,
+        adapter: KeystoneCalendarAdapter,
+        *,
+        allow_disposable_mutations: bool = False,
+    ) -> None:
         if type(adapter) is not KeystoneCalendarAdapter:
             raise TypeError("adapter must be the concrete KeystoneCalendarAdapter")
+        if type(allow_disposable_mutations) is not bool:
+            raise TypeError("allow_disposable_mutations must be a boolean")
         self._adapter = adapter
+        self._allow_disposable_mutations = allow_disposable_mutations
         self.trace: list[ToolCallRecord] = []
+
+    @property
+    def disposable_mutations_enabled(self) -> bool:
+        return (
+            self._allow_disposable_mutations
+            and self._adapter.disposable_mutations_enabled
+        )
 
     def _record_requests(
         self,
@@ -401,11 +417,64 @@ class KeystoneCalendarTool:
         )
         raise MutationDisabledError(f"Mutation tool disabled: {operation}")
 
+    def _write(self, operation: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        if not self.disposable_mutations_enabled:
+            self._mutation_disabled(operation, arguments)
+        try:
+            if operation == "CalendarEvent.create":
+                response = self._adapter._create_event_on_disposable_copy(arguments)
+            elif operation == "CalendarEvent.update":
+                response = self._adapter._update_event_on_disposable_copy(arguments)
+            else:
+                self._mutation_disabled(operation, arguments)
+        except KeystoneClientError as exc:
+            self.trace.append(
+                ToolCallRecord(
+                    operation,
+                    dict(arguments),
+                    mutating=True,
+                    succeeded=False,
+                    error=type(exc).__name__,
+                )
+            )
+            raise CalendarMutationError(
+                f"{operation} failed; verify event state before retrying."
+            ) from exc
+        if not isinstance(response, dict) or not isinstance(response.get("id"), str):
+            self.trace.append(
+                ToolCallRecord(
+                    operation,
+                    dict(arguments),
+                    mutating=True,
+                    succeeded=False,
+                    error="unverified_response",
+                )
+            )
+            raise CalendarMutationError(
+                f"{operation} returned no verifiable event ID."
+            )
+        self.trace.append(
+            ToolCallRecord(operation, dict(arguments), mutating=True)
+        )
+        return response
+
     def create_event(self, **arguments: Any) -> dict[str, Any]:
-        self._mutation_disabled("CalendarEvent.create", arguments)
+        if not self.disposable_mutations_enabled:
+            self._mutation_disabled("CalendarEvent.create", arguments)
+        return self._write("CalendarEvent.create", arguments)
 
     def update_event(self, **arguments: Any) -> dict[str, Any]:
-        self._mutation_disabled("CalendarEvent.update", arguments)
+        if not self.disposable_mutations_enabled:
+            self._mutation_disabled("CalendarEvent.update", arguments)
+        if set(arguments) - {"id", "start_at", "end_at"}:
+            raise ValueError(
+                "CalendarEvent.update accepts only ID and scheduled start/end fields."
+            )
+        if not {"id", "start_at", "end_at"}.issubset(arguments):
+            raise ValueError(
+                "CalendarEvent.update requires ID, start_at, and end_at."
+            )
+        return self._write("CalendarEvent.update", arguments)
 
     def delete_event(self, event_id: str) -> dict[str, Any]:
         self._mutation_disabled("CalendarEvent.delete", {"id": event_id})
@@ -423,6 +492,8 @@ class KeystoneCalendarTool:
 def run_keystone_goal(
     task: AgentTask,
     adapter: KeystoneCalendarAdapter,
+    *,
+    allow_disposable_mutations: bool = False,
 ) -> AgentResult:
     """Run an existing goal with only offline Keystone adapter data."""
 
@@ -430,9 +501,15 @@ def run_keystone_goal(
         context = dict(task.context)
         context["use_calendar_timezone_fallback"] = True
         task = AgentTask(task.goal, task.instruction, context)
-    tools = KeystoneCalendarTool(adapter)
+    tools = KeystoneCalendarTool(
+        adapter,
+        allow_disposable_mutations=allow_disposable_mutations,
+    )
     try:
-        return CalendarAgent(tools).run(task)
+        return CalendarAgent(
+            tools,
+            allow_disposable_writes=allow_disposable_mutations,
+        ).run(task)
     except KeystoneGoalIntegrationError as exc:
         return AgentResult(
             goal=task.goal,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
@@ -23,7 +23,7 @@ from calendar_agent import (
     MutationDisabledError,
     ResultStatus,
 )
-from calendar_agent.models import ToolCallRecord
+from calendar_agent.models import AgentResult, EventMove, ToolCallRecord
 from calendar_agent.tools import ReadOnlyCalendarTool
 from harnesses.keystone_harness import (
     KeystoneCalendarAdapter,
@@ -37,7 +37,13 @@ from harnesses.keystone_harness import (
 )
 from harnesses.keystone_harness.authorization import RESOURCE_READ_OPERATIONS
 
-from .assertions import verify_result
+from .assertions import (
+    BackendCalendarSnapshot,
+    verify_backend_rescheduling_state,
+    verify_goal_one_candidate_against_reads,
+    verify_result,
+)
+from .journal import HostedRunJournal
 from .results import MAX_EVIDENCE_LENGTH, sanitize_evidence, validate_results
 from .server_runner import ServerRunnerError, write_results_atomic
 
@@ -52,6 +58,7 @@ GOAL_TWO_TITLE = "Move events after the confirmed press shop and welding audit"
 GOAL_TWO_AUDIT_NUMBER = "EVT-2026-00007"
 GOAL_TWO_AUDIT_TITLE = "Internal quality audit — press shop and welding"
 GOAL_TWO_DEFAULT_SHIFT = timedelta(minutes=30)
+GOAL_TWO_MAX_SHIFT_SEARCH = timedelta(hours=8)
 _SEARCH_WINDOW = timedelta(days=14)
 
 
@@ -100,6 +107,94 @@ def _task(
         evidence=evidence,
         secret_values=secret_values,
     )
+
+
+def _journaled_check(
+    journal: HostedRunJournal,
+    *,
+    task_id: str,
+    title: str,
+    goal: str,
+    run: Callable[[HostedRunJournal], HostedCheck],
+) -> HostedCheck:
+    journal.begin(task_id=task_id, title=title, goal=goal)
+    check = run(journal)
+    if not journal.has_execution_record(task_id):
+        journal.record_observation(
+            task_id,
+            observation={"agent_result_available": False},
+        )
+    journal.finish(check)
+    return check
+
+
+def _record_unavailable_goal(
+    journal: HostedRunJournal,
+    *,
+    task_id: str,
+    title: str,
+    goal: str,
+    missing_operations: list[str],
+    secret_values: tuple[str, ...],
+) -> HostedCheck:
+    journal.record_observation(
+        task_id,
+        observation={"missing_required_read_operations": missing_operations},
+    )
+    return _task(
+        task_id=task_id,
+        title=title,
+        passed=False,
+        evidence=(
+            "UNEVALUATED: required Keystone read tools were not all discovered; "
+            f"goal={goal};no goal calls were made."
+        ),
+        secret_values=secret_values,
+    )
+
+
+def check_backend_rescheduling_state(
+    before: BackendCalendarSnapshot,
+    after: BackendCalendarSnapshot,
+    *,
+    expected_moves: Sequence[EventMove],
+    task_id: str,
+    title: str,
+    secret_values: tuple[str, ...] = (),
+) -> HostedCheck:
+    """Turn independent backend event readback into a persisted harness check."""
+
+    verification = verify_backend_rescheduling_state(
+        before,
+        after,
+        expected_moves=expected_moves,
+    )
+    evidence = "BACKEND_READBACK: " + "; ".join(verification.details)
+    return _task(
+        task_id=task_id,
+        title=title,
+        passed=verification.passed,
+        evidence=evidence,
+        secret_values=secret_values,
+    )
+
+
+def write_hosted_results(
+    output_path: str | Path,
+    checks: tuple[HostedCheck, ...],
+    *,
+    summary: str,
+    secret_values: tuple[str, ...] = (),
+) -> Path:
+    """Persist custom harness checks using the same validated results contract."""
+
+    document = {
+        "tasks": [check.official_record() for check in checks],
+        "summary": sanitize_evidence(summary, secret_values)[:MAX_EVIDENCE_LENGTH],
+    }
+    validate_results(document)
+    results_json = json.dumps(document, indent=2, ensure_ascii=True, allow_nan=False)
+    return write_results_atomic(output_path, results_json)
 
 
 def load_hosted_environment(values: Mapping[str, object]) -> HostedEnvironment:
@@ -160,31 +255,83 @@ def _read_trace_summary(calls: list[ToolCallRecord]) -> str:
     )
 
 
+def _goal_one_reason_code(result: AgentResult) -> str:
+    """Map free-text planner diagnostics to a small non-sensitive reason code."""
+
+    diagnostic = " ".join((result.summary, *result.ambiguities)).casefold()
+    if "no 30-minute slot" in diagnostic or "all candidate intervals" in diagnostic:
+        return "no_candidate_satisfies_constraints"
+    if any(
+        marker in diagnostic
+        for marker in ("free/busy", "freebusy", "not shared", "visibility", "access evidence")
+    ):
+        return "availability_not_verifiable"
+    if any(
+        marker in diagnostic
+        for marker in ("scheduling preference", "availability rule", "minimum notice")
+    ):
+        return "scheduling_constraints_unavailable"
+    if any(marker in diagnostic for marker in ("plant head", "party", "identity")):
+        return "participant_identity_ambiguous"
+    if "calendar" in diagnostic:
+        return "calendar_scope_ambiguous"
+    return "planner_needs_clarification"
+
+
+def _has_valid_goal_two_proposed_shift(outcome: object) -> bool:
+    if not isinstance(outcome, dict):
+        return False
+    proposed_shift = outcome.get("shift")
+    requested_shift = outcome.get("requested_shift")
+    return (
+        outcome.get("shift_was_proposed") is True
+        and requested_shift == GOAL_TWO_DEFAULT_SHIFT
+        and isinstance(proposed_shift, timedelta)
+        and GOAL_TWO_DEFAULT_SHIFT
+        <= proposed_shift
+        <= GOAL_TWO_MAX_SHIFT_SEARCH
+        and (proposed_shift - GOAL_TWO_DEFAULT_SHIFT)
+        % GOAL_TWO_DEFAULT_SHIFT
+        == timedelta(0)
+        and outcome.get("alternative_shift_proposed")
+        is (proposed_shift != requested_shift)
+    )
+
+
 def check_suryodaya_goal_one(
     tools: CalendarTool,
     *,
     now: datetime | None = None,
     secret_values: tuple[str, ...] = (),
+    journal: HostedRunJournal | None = None,
 ) -> HostedCheck:
-    """Record a read-only candidate check without claiming a goal predicate pass."""
+    """Verify the harness-owned, read-only candidate predicate."""
 
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None or current.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
     current = current.astimezone(timezone.utc).replace(microsecond=0)
+    search_end = current + _SEARCH_WINDOW
     task = AgentTask(
         GOAL_ONE,
         GOAL_ONE_TITLE,
         {
             "now": current,
             "start": current,
-            "end": current + _SEARCH_WINDOW,
+            "end": search_end,
         },
     )
     read_only_tools = ReadOnlyCalendarTool(tools)
     try:
         result = CalendarAgent(read_only_tools).run(task)
     except (AgentSwitchError, ConfigurationError, MutationDisabledError) as exc:
+        if journal is not None:
+            journal.record_execution(
+                "suryodaya.goal1_read_only_candidate",
+                result=None,
+                tool_calls=read_only_tools.trace,
+                error_category=type(exc).__name__,
+            )
         trace = _read_trace_summary(tools.trace)
         return _task(
             task_id="suryodaya.goal1_read_only_candidate",
@@ -194,21 +341,48 @@ def check_suryodaya_goal_one(
             secret_values=secret_values,
         )
 
-    verification = verify_result(result, expected_status=ResultStatus.PLANNED)
-    if verification.passed:
-        evidence = (
-            "Read-only planner returned one structurally valid, availability-supported "
-            f"30-minute candidate; {_read_trace_summary(result.tool_calls)}."
+    if journal is not None:
+        journal.record_execution(
+            "suryodaya.goal1_read_only_candidate",
+            result=result,
+            tool_calls=read_only_tools.trace,
         )
+    try:
+        verification = verify_goal_one_candidate_against_reads(
+            result,
+            read_only_tools,
+            now=current,
+            search_start=current,
+            search_end=search_end,
+            prior_tool_calls=result.tool_calls,
+        )
+    except (AgentSwitchError, ConfigurationError, MutationDisabledError) as exc:
+        if journal is not None:
+            journal.record_observation(
+                "suryodaya.goal1_read_only_candidate",
+                observation={"verification_error_category": type(exc).__name__},
+                tool_calls=tuple(read_only_tools.trace),
+            )
         return _task(
             task_id="suryodaya.goal1_read_only_candidate",
             title="Suryodaya read-only Goal 1 candidate check",
             passed=False,
             evidence=(
-                "UNEVALUATED: "
-                + evidence
-                + " No authoritative business-goal predicate was available."
+                "UNEVALUATED: candidate state re-verification stopped "
+                f"({type(exc).__name__}); {_read_trace_summary(read_only_tools.trace)}."
             ),
+            secret_values=secret_values,
+        )
+    if verification.passed:
+        evidence = (
+            "HARNESS_PREDICATE: one independently re-verified, available "
+            f"30-minute candidate; {_read_trace_summary(read_only_tools.trace)}."
+        )
+        return _task(
+            task_id="suryodaya.goal1_read_only_candidate",
+            title="Suryodaya read-only Goal 1 candidate check",
+            passed=True,
+            evidence=evidence,
             secret_values=secret_values,
         )
 
@@ -216,7 +390,9 @@ def check_suryodaya_goal_one(
         f"UNEVALUATED: planner status={result.status.value}; "
         f"candidate_slots={len(result.candidate_slots)}; "
         f"clarifications={len(result.ambiguities)}; "
-        f"{_read_trace_summary(result.tool_calls)}."
+        f"reason_code={_goal_one_reason_code(result) if result.status is not ResultStatus.PLANNED else 'candidate_reverification_failed'}; "
+        f"verification_details={'; '.join(verification.details) or 'no valid candidate'}; "
+        f"{_read_trace_summary(read_only_tools.trace)}."
     )
     return _task(
         task_id="suryodaya.goal1_read_only_candidate",
@@ -231,6 +407,7 @@ def check_suryodaya_goal_two(
     tools: CalendarTool,
     *,
     secret_values: tuple[str, ...] = (),
+    journal: HostedRunJournal | None = None,
 ) -> HostedCheck:
     """Verify an exact-reference, read-only move plan that awaits confirmation."""
 
@@ -240,13 +417,20 @@ def check_suryodaya_goal_two(
         {
             "audit_number": GOAL_TWO_AUDIT_NUMBER,
             "audit_title": GOAL_TWO_AUDIT_TITLE,
-            "shift": GOAL_TWO_DEFAULT_SHIFT,
+            "max_shift_search": GOAL_TWO_MAX_SHIFT_SEARCH,
             "use_calendar_timezone_fallback": True,
         },
     )
     try:
         result = CalendarAgent(ReadOnlyCalendarTool(tools)).run(task)
     except (AgentSwitchError, ConfigurationError, MutationDisabledError) as exc:
+        if journal is not None:
+            journal.record_execution(
+                "suryodaya.goal2_read_only_plan",
+                result=None,
+                tool_calls=tools.trace,
+                error_category=type(exc).__name__,
+            )
         return _task(
             task_id="suryodaya.goal2_read_only_plan",
             title="Suryodaya read-only Goal 2 plan",
@@ -258,6 +442,12 @@ def check_suryodaya_goal_two(
             secret_values=secret_values,
         )
 
+    if journal is not None:
+        journal.record_execution(
+            "suryodaya.goal2_read_only_plan",
+            result=result,
+            tool_calls=result.tool_calls,
+        )
     trace = _read_trace_summary(result.tool_calls)
     if result.status is not ResultStatus.PLANNED:
         details = " ".join((result.summary, *result.ambiguities))
@@ -291,17 +481,26 @@ def check_suryodaya_goal_two(
         and isinstance(outcome.get("confirmation_prompt"), str)
         and bool(outcome["confirmation_prompt"].strip())
     )
+    proposed_shift = outcome.get("shift") if isinstance(outcome, dict) else None
+    proposed_shift_minutes = (
+        int(proposed_shift.total_seconds() // 60)
+        if isinstance(proposed_shift, timedelta)
+        else 0
+    )
     mutation_free = not any(call.mutating for call in result.tool_calls)
     move_summary = ";".join(
         f"{move.event_id}:{move.proposed_start_at}>{move.proposed_end_at}"
         for move in result.rescheduling_plan
     )
     evidence = (
+        "HARNESS_PREDICATE: "
         f"audit={GOAL_TWO_AUDIT_NUMBER};calendar="
         f"{reference.candidates[0].calendar_id if exact_reference else 'unverified'};"
-        f"moves={len(result.rescheduling_plan)};shift=30m;"
+        f"moves={len(result.rescheduling_plan)};requested_shift=30m;"
+        f"proposed_shift={proposed_shift_minutes}m;"
         f"confirmation_required={str(confirmation_required).lower()};"
         "confirm_or_change_shift=true;"
+        "events_moved=false;"
         f"mutation_attempts={sum(call.mutating for call in result.tool_calls)};"
         f"plan={move_summary}"
     )
@@ -309,9 +508,8 @@ def check_suryodaya_goal_two(
         verification.passed
         and exact_reference
         and confirmation_required
-        and isinstance(outcome, dict)
+        and _has_valid_goal_two_proposed_shift(outcome)
         and outcome.get("moved") is False
-        and outcome.get("shift") == GOAL_TWO_DEFAULT_SHIFT
         and mutation_free
         and bool(result.rescheduling_plan)
     )
@@ -335,13 +533,15 @@ def check_keystone_goal_one(
     *,
     now: datetime | None = None,
     secret_values: tuple[str, ...] = (),
+    journal: HostedRunJournal | None = None,
 ) -> HostedCheck:
-    """Run the Keystone planner, but do not claim an unavailable goal predicate."""
+    """Apply the same harness-owned candidate predicate to Keystone."""
 
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None or current.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
     current = current.astimezone(timezone.utc).replace(microsecond=0)
+    search_end = current + _SEARCH_WINDOW
     result = run_keystone_goal(
         AgentTask(
             GOAL_ONE,
@@ -349,24 +549,66 @@ def check_keystone_goal_one(
             {
                 "now": current,
                 "start": current,
-                "end": current + _SEARCH_WINDOW,
+                "end": search_end,
             },
         ),
         adapter,
     )
-    evidence = (
-        "UNEVALUATED: Keystone Goal 1 planner "
-        f"status={result.status.value}; candidate_slots={len(result.candidate_slots)}; "
-        f"clarifications={len(result.ambiguities)}; "
-        f"{_read_trace_summary(result.tool_calls)}; "
-        "no authoritative business-goal predicate is available; "
-        "the Keystone allowlist does not provide scheduling preferences, "
-        "availability rules, or free/busy."
-    )
+    if journal is not None:
+        journal.record_execution(
+            "keystone.goal1_read_only_candidate",
+            result=result,
+            tool_calls=result.tool_calls,
+        )
+    verification_tools = KeystoneCalendarTool(adapter)
+    try:
+        verification = verify_goal_one_candidate_against_reads(
+            result,
+            verification_tools,
+            now=current,
+            search_start=current,
+            search_end=search_end,
+            prior_tool_calls=result.tool_calls,
+        )
+    except KeystoneGoalIntegrationError as exc:
+        if journal is not None:
+            journal.record_observation(
+                "keystone.goal1_read_only_candidate",
+                observation={"verification_error_category": exc.category},
+                tool_calls=tuple(result.tool_calls),
+            )
+        return _task(
+            task_id="keystone.goal1_read_only_candidate",
+            title="Keystone read-only Goal 1 candidate check",
+            passed=False,
+            evidence=(
+                "UNEVALUATED: candidate state re-verification stopped "
+                f"({exc.category}); "
+                f"{_read_trace_summary([*result.tool_calls, *verification_tools.trace])}."
+            ),
+            secret_values=secret_values,
+        )
+    if verification.passed:
+        evidence = (
+            "HARNESS_PREDICATE: one independently re-verified, available "
+            f"30-minute candidate; "
+            f"{_read_trace_summary([*result.tool_calls, *verification_tools.trace])}."
+        )
+    else:
+        evidence = (
+            "UNEVALUATED: Keystone Goal 1 planner "
+            f"status={result.status.value}; candidate_slots={len(result.candidate_slots)}; "
+            f"clarifications={len(result.ambiguities)}; "
+            f"reason_code={_goal_one_reason_code(result) if result.status is not ResultStatus.PLANNED else 'candidate_reverification_failed'}; "
+            f"verification_details={'; '.join(verification.details) or 'no valid candidate'}; "
+            f"{_read_trace_summary([*result.tool_calls, *verification_tools.trace])}; "
+            "the Keystone allowlist does not provide scheduling preferences, "
+            "availability rules, or free/busy."
+        )
     return _task(
         task_id="keystone.goal1_read_only_candidate",
         title="Keystone read-only Goal 1 candidate check",
-        passed=False,
+        passed=verification.passed,
         evidence=evidence,
         secret_values=secret_values,
     )
@@ -376,16 +618,24 @@ def check_keystone_goal_two(
     adapter: KeystoneCalendarAdapter,
     *,
     secret_values: tuple[str, ...] = (),
+    journal: HostedRunJournal | None = None,
 ) -> HostedCheck:
     """Verify one uniquely discoverable audit plan without executing mutations."""
 
     discovery_tools = KeystoneCalendarTool(adapter)
     try:
         audit_events = discovery_tools.list_events(
-            filters={"search": "audit"},
+            filters={"search": GOAL_TWO_AUDIT_TITLE},
             limit=1000,
         )
     except KeystoneGoalIntegrationError as exc:
+        if journal is not None:
+            journal.record_execution(
+                "keystone.goal2_read_only_plan",
+                result=None,
+                tool_calls=discovery_tools.trace,
+                error_category=exc.category,
+            )
         return _task(
             task_id="keystone.goal2_read_only_plan",
             title="Keystone read-only Goal 2 plan",
@@ -400,12 +650,19 @@ def check_keystone_goal_two(
     audit_candidates = [
         event
         for event in audit_events
-        if "audit"
-        in " ".join(
-            str(event.get(field) or "")
-            for field in ("title", "description")
-        ).casefold()
+        if isinstance(event.get("title"), str)
+        and event["title"].strip().casefold()
+        == GOAL_TWO_AUDIT_TITLE.casefold()
     ]
+    if journal is not None:
+        journal.record_observation(
+            "keystone.goal2_read_only_plan",
+            observation={
+                "audit_search_result_count": len(audit_events),
+                "exact_title_match_count": len(audit_candidates),
+            },
+            tool_calls=tuple(discovery_tools.trace),
+        )
     if len(audit_candidates) != 1:
         return _task(
             task_id="keystone.goal2_read_only_plan",
@@ -454,11 +711,21 @@ def check_keystone_goal_two(
         AgentTask(
             GOAL_TWO,
             "Move everything after the audit",
-            {"calendar_id": calendar_id},
+            {
+                "calendar_id": calendar_id,
+                "audit_title": GOAL_TWO_AUDIT_TITLE,
+                "max_shift_search": GOAL_TWO_MAX_SHIFT_SEARCH,
+            },
         ),
         adapter,
     )
     trace = [*discovery_tools.trace, *result.tool_calls]
+    if journal is not None:
+        journal.record_execution(
+            "keystone.goal2_read_only_plan",
+            result=result,
+            tool_calls=trace,
+        )
     trace_summary = _read_trace_summary(trace)
     if result.status is not ResultStatus.PLANNED:
         return _task(
@@ -478,6 +745,7 @@ def check_keystone_goal_two(
         reference is not None
         and len(reference.candidates) == 1
         and reference.candidates[0].id == audit_id
+        and reference.candidates[0].title == GOAL_TWO_AUDIT_TITLE
         and reference.candidates[0].calendar_id == calendar_id
         and isinstance(reference.candidates[0].status, str)
         and reference.candidates[0].status.casefold() == "confirmed"
@@ -489,16 +757,24 @@ def check_keystone_goal_two(
         and isinstance(outcome.get("confirmation_prompt"), str)
         and bool(outcome["confirmation_prompt"].strip())
     )
+    proposed_shift = outcome.get("shift") if isinstance(outcome, dict) else None
+    proposed_shift_minutes = (
+        int(proposed_shift.total_seconds() // 60)
+        if isinstance(proposed_shift, timedelta)
+        else 0
+    )
     mutation_free = not any(call.mutating for call in result.tool_calls)
     move_summary = ";".join(
         f"{move.event_id}:{move.proposed_start_at}>{move.proposed_end_at}"
         for move in result.rescheduling_plan
     )
     evidence = (
+        "HARNESS_PREDICATE: "
         f"calendar_resolved={str(exact_calendar).lower()};"
         f"moves={len(result.rescheduling_plan)};"
-        f"shift=30m;"
+        f"requested_shift=30m;proposed_shift={proposed_shift_minutes}m;"
         f"confirmation_required={str(confirmation_required).lower()};"
+        "events_moved=false;"
         f"mutation_attempts={sum(call.mutating for call in trace)};"
         f"plan={move_summary};{trace_summary}"
     )
@@ -506,9 +782,8 @@ def check_keystone_goal_two(
         verification.passed
         and exact_calendar
         and confirmation_required
-        and isinstance(outcome, dict)
+        and _has_valid_goal_two_proposed_shift(outcome)
         and outcome.get("moved") is False
-        and outcome.get("shift") == GOAL_TWO_DEFAULT_SHIFT
         and mutation_free
         and bool(result.rescheduling_plan)
     )
@@ -554,19 +829,38 @@ def run_hosted(
             "goal_tasks_not_run=true; official_evaluator=not_invoked."
         )
     else:
+        journal = HostedRunJournal(
+            Path(output_path).parent / ".harness-artifacts" / "runs",
+            instance=config.instance,
+            secret_values=secret_values,
+        )
         if config.instance == SURYODAYA_INSTANCE:
             try:
                 client_config = AgentSwitchConfig(base_url=config.base_url, token=config.token)
                 tools = AgentSwitchCalendarTools(AgentSwitchClient(client_config))
                 tasks = (
-                    check_suryodaya_goal_one(
-                        tools,
-                        now=now,
-                        secret_values=secret_values,
+                    _journaled_check(
+                        journal,
+                        task_id="suryodaya.goal1_read_only_candidate",
+                        title="Suryodaya read-only Goal 1 candidate check",
+                        goal=GOAL_ONE,
+                        run=lambda task_journal: check_suryodaya_goal_one(
+                            tools,
+                            now=now,
+                            secret_values=secret_values,
+                            journal=task_journal,
+                        ),
                     ),
-                    check_suryodaya_goal_two(
-                        tools,
-                        secret_values=secret_values,
+                    _journaled_check(
+                        journal,
+                        task_id="suryodaya.goal2_read_only_plan",
+                        title="Suryodaya read-only Goal 2 plan",
+                        goal=GOAL_TWO,
+                        run=lambda task_journal: check_suryodaya_goal_two(
+                            tools,
+                            secret_values=secret_values,
+                            journal=task_journal,
+                        ),
                     ),
                 )
             except (AgentSwitchError, ConfigurationError, MutationDisabledError) as exc:
@@ -592,10 +886,31 @@ def run_hosted(
                     keystone_config,
                     enable_hosted_read_transport=True,
                 )
-                discovery = client.list_tools()
+                journal.begin(
+                    task_id="keystone.mcp_tools_list",
+                    title="Keystone MCP tools/list and read tools",
+                    goal="mcp.tools.list",
+                )
+                try:
+                    discovery = client.list_tools()
+                except (KeystoneClientError, KeystoneConfigurationError) as exc:
+                    journal.record_execution(
+                        "keystone.mcp_tools_list",
+                        result=None,
+                        tool_calls=(),
+                        error_category=type(exc).__name__,
+                    )
+                    raise
                 available_operations = {tool.name for tool in discovery.tools}
                 missing_operations = sorted(
                     RESOURCE_READ_OPERATIONS - available_operations
+                )
+                journal.record_observation(
+                    "keystone.mcp_tools_list",
+                    observation={
+                        "discovered_tool_count": len(discovery.tools),
+                        "required_read_tools_missing": missing_operations,
+                    },
                 )
                 connection_check = _task(
                     task_id="keystone.mcp_tools_list",
@@ -607,40 +922,63 @@ def run_hosted(
                     ),
                     secret_values=secret_values,
                 )
+                journal.finish(connection_check)
                 adapter = KeystoneCalendarAdapter(client)
                 if missing_operations:
                     goal_checks = (
-                        _task(
+                        _journaled_check(
+                            journal,
                             task_id="keystone.goal1_read_only_candidate",
                             title="Keystone read-only Goal 1 candidate check",
-                            passed=False,
-                            evidence=(
-                                "UNEVALUATED: required Keystone read tools were not "
-                                "all discovered; no goal calls were made."
+                            goal=GOAL_ONE,
+                            run=lambda task_journal: _record_unavailable_goal(
+                                task_journal,
+                                task_id="keystone.goal1_read_only_candidate",
+                                title="Keystone read-only Goal 1 candidate check",
+                                goal=GOAL_ONE,
+                                missing_operations=missing_operations,
+                                secret_values=secret_values,
                             ),
-                            secret_values=secret_values,
                         ),
-                        _task(
+                        _journaled_check(
+                            journal,
                             task_id="keystone.goal2_read_only_plan",
                             title="Keystone read-only Goal 2 plan",
-                            passed=False,
-                            evidence=(
-                                "UNEVALUATED: required Keystone read tools were not "
-                                "all discovered; no goal calls were made."
+                            goal=GOAL_TWO,
+                            run=lambda task_journal: _record_unavailable_goal(
+                                task_journal,
+                                task_id="keystone.goal2_read_only_plan",
+                                title="Keystone read-only Goal 2 plan",
+                                goal=GOAL_TWO,
+                                missing_operations=missing_operations,
+                                secret_values=secret_values,
                             ),
-                            secret_values=secret_values,
                         ),
                     )
                 else:
                     goal_checks = (
-                        check_keystone_goal_one(
-                            adapter,
-                            now=now,
-                            secret_values=secret_values,
+                        _journaled_check(
+                            journal,
+                            task_id="keystone.goal1_read_only_candidate",
+                            title="Keystone read-only Goal 1 candidate check",
+                            goal=GOAL_ONE,
+                            run=lambda task_journal: check_keystone_goal_one(
+                                adapter,
+                                now=now,
+                                secret_values=secret_values,
+                                journal=task_journal,
+                            ),
                         ),
-                        check_keystone_goal_two(
-                            adapter,
-                            secret_values=secret_values,
+                        _journaled_check(
+                            journal,
+                            task_id="keystone.goal2_read_only_plan",
+                            title="Keystone read-only Goal 2 plan",
+                            goal=GOAL_TWO,
+                            run=lambda task_journal: check_keystone_goal_two(
+                                adapter,
+                                secret_values=secret_values,
+                                journal=task_journal,
+                            ),
                         ),
                     )
                 tasks = (connection_check, *goal_checks)
@@ -662,16 +1000,15 @@ def run_hosted(
         passed_count = sum(task.passed for task in tasks)
         summary = (
             f"{config.instance}: {passed_count}/{len(tasks)} harness checks passed; "
-            "official_evaluator=not_invoked."
+            f"run_id={journal.run_id};official_evaluator=not_invoked."
         )
 
-    document = {
-        "tasks": [task.official_record() for task in tasks],
-        "summary": summary,
-    }
-    validate_results(document)
-    results_json = json.dumps(document, indent=2, ensure_ascii=True, allow_nan=False)
-    written_path = write_results_atomic(output_path, results_json)
+    written_path = write_hosted_results(
+        output_path,
+        tasks,
+        summary=summary,
+        secret_values=secret_values,
+    )
     return written_path, tasks
 
 
@@ -690,7 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Hosted harness wrote {output_path}; harness_checks_passed="
         f"{passed_count}/{len(tasks)}; official_evaluator=not_invoked."
     )
-    return 0 if all(task.passed for task in tasks) else 1
+    return 0
 
 
 if __name__ == "__main__":

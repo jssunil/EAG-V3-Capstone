@@ -336,7 +336,7 @@ def map_event_attendee_record(
 
 
 class KeystoneCalendarAdapter:
-    """Allowlisted list-only adapter; the supplied Keystone client stays disabled."""
+    """Allowlisted resource adapter with opt-in disposable event mutations."""
 
     def __init__(
         self,
@@ -359,6 +359,26 @@ class KeystoneCalendarAdapter:
         self._synthetic_response_pages = synthetic_response_pages
         self._max_pages = max_pages
         self._max_records = max_records
+
+    @property
+    def disposable_mutations_enabled(self) -> bool:
+        return self._client.hosted_mutation_transport_enabled
+
+    def _create_event_on_disposable_copy(
+        self, arguments: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        authorization = self._client.authorize_mutation_request(
+            "CalendarEvent.create", arguments
+        )
+        return self._client.call_authorized_mutation(authorization)
+
+    def _update_event_on_disposable_copy(
+        self, arguments: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        authorization = self._client.authorize_mutation_request(
+            "CalendarEvent.update", arguments
+        )
+        return self._client.call_authorized_mutation(authorization)
 
     def list_parties(
         self,

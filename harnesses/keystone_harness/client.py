@@ -1,13 +1,15 @@
-"""Guarded MCP transport with an explicit hosted read-only opt-in."""
+"""Guarded MCP transport with explicit hosted read and disposable-write opt-ins."""
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import threading
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 from weakref import WeakSet
 
 import requests
@@ -122,6 +124,23 @@ class KeystoneReadAuthorization:
         return json.loads(self._arguments_json)
 
 
+@dataclass(frozen=True, eq=False)
+class KeystoneMutationAuthorization:
+    """Client-bound opt-in authorization for one disposable Calendar mutation."""
+
+    operation: str
+    _arguments_json: str = field(repr=False)
+    _client_identity: object = field(repr=False)
+    _config: KeystoneConfig = field(repr=False)
+    _session: object = field(repr=False)
+    _discovery: ToolDiscoveryResult = field(repr=False)
+    _descriptor_snapshot: DiscoveredTool = field(repr=False)
+
+    @property
+    def arguments(self) -> dict[str, Any]:
+        return json.loads(self._arguments_json)
+
+
 @dataclass(frozen=True)
 class _CalendarListPilotRequest:
     """Client-claimed immutable request state passed only to the bound transport."""
@@ -140,10 +159,11 @@ _HOSTED_MCP_PROTOCOL_VERSION = "2025-11-25"
 
 
 class KeystoneClient:
-    """Keystone client with discovery-only defaults and hosted read opt-in.
+    """Keystone client with discovery-only defaults and explicit hosted opt-ins.
 
     ``tools/list`` discovers metadata. Raw ``call_read`` stays disabled;
-    hosted clients may invoke only client-authorized resource reads.
+    hosted reads and disposable Calendar mutations use separate authorization
+    paths, both disabled by default.
     """
 
     def __init__(
@@ -152,18 +172,72 @@ class KeystoneClient:
         session: requests.Session | None = None,
         *,
         enable_hosted_read_transport: bool = False,
+        enable_hosted_mutation_transport: bool = False,
+        approved_disposable_base_url: str | None = None,
     ) -> None:
         if not isinstance(config, KeystoneConfig):
             raise TypeError("config must be a KeystoneConfig")
         if type(enable_hosted_read_transport) is not bool:
             raise TypeError("enable_hosted_read_transport must be a boolean")
+        if type(enable_hosted_mutation_transport) is not bool:
+            raise TypeError("enable_hosted_mutation_transport must be a boolean")
+        if approved_disposable_base_url is not None and not isinstance(
+            approved_disposable_base_url, str
+        ):
+            raise TypeError("approved_disposable_base_url must be text")
         if enable_hosted_read_transport and not config.is_hosted_runner_config:
             raise KeystoneOperationNotAllowedError(
                 "Hosted read transport requires platform-injected runner configuration."
             )
+        if enable_hosted_mutation_transport:
+            if not enable_hosted_read_transport or not config.is_hosted_runner_config:
+                raise KeystoneOperationNotAllowedError(
+                    "Hosted Calendar mutations require the explicitly opted-in hosted transport."
+                )
+            target = urlsplit(config.base_url)
+            hostname = target.hostname or ""
+            try:
+                ipaddress.ip_address(hostname.rstrip("."))
+            except ValueError:
+                is_ip_address = False
+                try:
+                    hostname = (
+                        hostname.encode("idna").decode("ascii").rstrip(".").casefold()
+                    )
+                except UnicodeError:
+                    raise KeystoneOperationNotAllowedError(
+                        "Disposable Calendar mutation target has an invalid host."
+                    ) from None
+            else:
+                is_ip_address = True
+            shared_live_domain = "agentswitch.theschoolofai.in"
+            is_shared_live_origin = (
+                hostname == shared_live_domain
+                or hostname.endswith(f".{shared_live_domain}")
+            )
+            if target.scheme.casefold() != "https":
+                raise KeystoneOperationNotAllowedError(
+                    "Disposable Calendar mutations require an HTTPS target."
+                )
+            if is_shared_live_origin:
+                raise KeystoneOperationNotAllowedError(
+                    "Calendar mutations are disabled for shared AgentSwitch live origins."
+                )
+            if is_ip_address:
+                raise KeystoneOperationNotAllowedError(
+                    "Disposable Calendar mutations require an explicitly named HTTPS host."
+                )
+            if (
+                not approved_disposable_base_url
+                or approved_disposable_base_url.rstrip("/") != config.base_url
+            ):
+                raise KeystoneOperationNotAllowedError(
+                    "Disposable Calendar mutations require an exact approved disposable base URL."
+                )
         self.config = config
         self._session = session if session is not None else requests.Session()
         self._hosted_read_transport_enabled = enable_hosted_read_transport
+        self._hosted_mutation_transport_enabled = enable_hosted_mutation_transport
         self._authorization_identity = object()
         self._discovery_result: ToolDiscoveryResult | None = None
         self._discovery_tools_snapshot: tuple[DiscoveredTool, ...] | None = None
@@ -171,12 +245,18 @@ class KeystoneClient:
         self._discovery_session: object | None = None
         self._issued_read_authorizations: WeakSet[KeystoneReadAuthorization] = WeakSet()
         self._consumed_hosted_read_authorizations: WeakSet[KeystoneReadAuthorization] = WeakSet()
+        self._issued_mutation_authorizations: WeakSet[KeystoneMutationAuthorization] = WeakSet()
+        self._consumed_mutation_authorizations: WeakSet[KeystoneMutationAuthorization] = WeakSet()
         self._state_lock = threading.RLock()
         self._discovery_in_progress = False
         self._calendar_list_attempted = False
         self._next_request_id = 3 if enable_hosted_read_transport else 2
         self._hosted_initialized = False
         self._calendar_list_transport: CalendarListPilotTransport | None = None
+
+    @property
+    def hosted_mutation_transport_enabled(self) -> bool:
+        return self._hosted_mutation_transport_enabled
 
     def list_tools(self) -> ToolDiscoveryResult:
         """Initialize opted-in hosted sessions, then fetch the MCP tool catalog."""
@@ -539,6 +619,84 @@ class KeystoneClient:
                 )
             return descriptor
 
+    def authorize_mutation_request(
+        self,
+        operation: str,
+        arguments: Mapping[str, Any],
+    ) -> KeystoneMutationAuthorization:
+        """Bind one allowed Calendar mutation to hosted opt-in and discovery."""
+
+        if not self._hosted_mutation_transport_enabled:
+                raise KeystoneOperationNotAllowedError(
+                    "Disposable hosted Calendar mutation transport is disabled."
+                )
+        with self._state_lock:
+                discovery = self._require_owned_discovery()
+                from .authorization import validate_disposable_calendar_mutation_policy
+
+                descriptor = validate_disposable_calendar_mutation_policy(
+                    discovery, operation, arguments
+                )
+                try:
+                    arguments_json = json.dumps(
+                        dict(arguments),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    )
+                except (TypeError, ValueError):
+                    raise KeystoneProtocolError(
+                        "Calendar mutation arguments cannot be represented as JSON."
+                    ) from None
+                authorization = KeystoneMutationAuthorization(
+                    operation=operation,
+                    _arguments_json=arguments_json,
+                    _client_identity=self._authorization_identity,
+                    _config=self.config,
+                    _session=self._session,
+                    _discovery=discovery,
+                    _descriptor_snapshot=deepcopy(descriptor),
+                )
+                self._issued_mutation_authorizations.add(authorization)
+                return authorization
+
+    def validate_mutation_authorization(
+        self,
+        authorization: KeystoneMutationAuthorization,
+    ) -> DiscoveredTool:
+        """Revalidate the one-use disposable mutation authorization."""
+
+        with self._state_lock:
+                if (
+                    not self._hosted_mutation_transport_enabled
+                    or not isinstance(authorization, KeystoneMutationAuthorization)
+                    or authorization not in self._issued_mutation_authorizations
+                    or authorization._client_identity is not self._authorization_identity
+                    or authorization._config is not self.config
+                    or authorization._session is not self._session
+                ):
+                    raise KeystoneOperationNotAllowedError(
+                        "Mutation authorization is not enabled or bound to this Keystone client."
+                    )
+                discovery = self._require_owned_discovery()
+                if authorization._discovery is not discovery:
+                    raise KeystoneOperationNotAllowedError(
+                        "Mutation authorization belongs to a different discovery response."
+                    )
+                from .authorization import validate_disposable_calendar_mutation_policy
+
+                descriptor = validate_disposable_calendar_mutation_policy(
+                    discovery,
+                    authorization.operation,
+                    authorization.arguments,
+                )
+                if descriptor != authorization._descriptor_snapshot:
+                    raise KeystoneOperationNotAllowedError(
+                        "The mutation descriptor changed after authorization."
+                    )
+                return descriptor
+
     def _clear_discovery_binding(self) -> None:
         self._discovery_result = None
         self._discovery_tools_snapshot = None
@@ -546,6 +704,8 @@ class KeystoneClient:
         self._discovery_session = None
         self._issued_read_authorizations.clear()
         self._consumed_hosted_read_authorizations.clear()
+        self._issued_mutation_authorizations.clear()
+        self._consumed_mutation_authorizations.clear()
 
     def _require_owned_discovery(self) -> ToolDiscoveryResult:
         if self._discovery_in_progress:
@@ -673,6 +833,107 @@ class KeystoneClient:
         ):
             raise KeystoneProtocolError(
                 "Keystone hosted read did not return a validated structured resource page."
+            )
+        return dict(parsed.structured_content)
+
+    def call_authorized_mutation(
+        self,
+        authorization: KeystoneMutationAuthorization,
+    ) -> dict[str, Any]:
+        """Perform one explicitly authorized event create/update on a disposable copy."""
+
+        if not self._hosted_mutation_transport_enabled:
+            raise KeystoneOperationNotAllowedError(
+                "Disposable hosted Calendar mutation transport is disabled."
+            )
+
+        from .mcp_response import parse_mcp_tool_call_response
+
+        with self._state_lock:
+            descriptor = self.validate_mutation_authorization(authorization)
+            if authorization in self._consumed_mutation_authorizations:
+                raise KeystoneOperationNotAllowedError(
+                    "A disposable Calendar mutation authorization can be used only once."
+                )
+            if not isinstance(descriptor.output_schema, Mapping):
+                raise KeystoneProtocolError(
+                    "Calendar mutations require a discovered output schema."
+                )
+            config = self.config
+            session = self._session
+            try:
+                token = config.require_token()
+            except KeystoneConfigurationError:
+                raise KeystoneAuthenticationError(
+                    "Set AGENTSWITCH_TOKEN for the disposable Calendar mutation."
+                ) from None
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            self._consumed_mutation_authorizations.add(authorization)
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": authorization.operation,
+                "arguments": authorization.arguments,
+            },
+        }
+        try:
+            response = session.post(
+                config.endpoint,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+                json=payload,
+                timeout=config.timeout,
+                allow_redirects=False,
+            )
+        except requests.Timeout as exc:
+            raise KeystoneTimeoutError(
+                "Disposable Calendar mutation timed out; verify state before retrying."
+            ) from exc
+        except requests.RequestException as exc:
+            raise KeystoneTransportError(
+                "Disposable Calendar mutation transport failed; verify state before retrying."
+            ) from exc
+
+        status_code = getattr(response, "status_code", None)
+        if type(status_code) is not int:
+            raise KeystoneProtocolError(
+                "Disposable Calendar mutation returned an invalid HTTP status."
+            )
+        if not 200 <= status_code < 300:
+            if status_code == 401:
+                raise KeystoneAuthenticationError(
+                    "Keystone rejected the disposable Calendar mutation."
+                )
+            raise KeystoneHttpError(
+                f"Keystone returned HTTP {status_code} for a Calendar mutation."
+            )
+        try:
+            message = response.json()
+        except ValueError as exc:
+            raise KeystoneJsonError(
+                "Disposable Calendar mutation returned invalid JSON."
+            ) from exc
+
+        parsed = parse_mcp_tool_call_response(
+            message,
+            request_id,
+            descriptor.output_schema,
+            expose_structured_content=True,
+        )
+        if (
+            parsed.structured_content is None
+            or not parsed.output_schema_validated
+            or not isinstance(parsed.structured_content.get("id"), str)
+        ):
+            raise KeystoneProtocolError(
+                "Calendar mutation returned no schema-valid event ID; re-read state before retrying."
             )
         return dict(parsed.structured_content)
 

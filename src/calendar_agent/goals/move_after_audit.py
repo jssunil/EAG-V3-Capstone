@@ -11,18 +11,23 @@ from ..models import (
     AgentResult,
     AgentTask,
     AuditReference,
+    CalendarMutationError,
     CalendarEventPage,
     CalendarEventRef,
     EventMove,
+    MutationDisabledError,
     ResultStatus,
 )
 from ..tools import CalendarEventListError, CalendarTool
+from ..confirmation import confirms_shift
 
 
 GOAL = "calendar.move_after_audit"
 _EVENT_LIST_LIMIT = 1000
 _MAX_EVENT_LIST_PAGES = 100
 _DEFAULT_PROPOSED_SHIFT = timedelta(minutes=30)
+_SHIFT_SEARCH_INCREMENT = timedelta(minutes=30)
+_MAX_ALTERNATIVE_SHIFT = timedelta(hours=8)
 
 
 def _event_ref(
@@ -474,7 +479,23 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             search_terms=(audit_number.strip(),),
         )
     else:
-        reference = AuditReference(candidates=(), search_terms=("audit",))
+        raw_audit_title = task.context.get("audit_title")
+        if raw_audit_title is not None and (
+            not isinstance(raw_audit_title, str) or not raw_audit_title.strip()
+        ):
+            return _clarification(
+                task,
+                AuditReference(candidates=(), search_terms=()),
+                "The expected audit title is invalid.",
+                "Provide the exact non-empty audit title to disambiguate audit candidates.",
+            )
+        expected_audit_title = (
+            raw_audit_title.strip()
+            if isinstance(raw_audit_title, str)
+            else None
+        )
+        search_term = expected_audit_title or "audit"
+        reference = AuditReference(candidates=(), search_terms=(search_term,))
         raw_calendar_id = task.context.get("calendar_id")
         if not isinstance(raw_calendar_id, str) or not raw_calendar_id.strip():
             return _clarification(
@@ -489,7 +510,7 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             audit_records = _list_complete_events(
                 tools,
                 calendar_id=calendar_id,
-                search="audit",
+                search=search_term,
             )
         except CalendarEventListError as exc:
             return _clarification(
@@ -499,7 +520,19 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
                 str(exc),
             )
 
-        audit_like = [event for event in audit_records if _is_audit_candidate(event)]
+        audit_like = [
+            event
+            for event in audit_records
+            if _is_audit_candidate(event)
+            and (
+                expected_audit_title is None
+                or (
+                    isinstance(event.get("title"), str)
+                    and event["title"].strip().casefold()
+                    == expected_audit_title.casefold()
+                )
+            )
+        ]
         if (
             fallback_timezone is None
             and use_calendar_timezone
@@ -518,14 +551,18 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             candidates=tuple(
                 _event_ref(event, fallback_timezone) for event in audit_like
             ),
-            search_terms=("audit",),
+            search_terms=(search_term,),
         )
         if not audit_like:
             return _clarification(
                 task,
                 reference,
                 "No audit candidate was found.",
-                "An event whose title or description contains 'audit' is required.",
+                (
+                    f"An event with the exact title {expected_audit_title!r} is required."
+                    if expected_audit_title is not None
+                    else "An event whose title or description contains 'audit' is required."
+                ),
             )
 
         parsed_audits = [
@@ -646,8 +683,7 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             f"Duplicate event IDs: {', '.join(duplicate_event_ids)}.",
         )
 
-    moves_with_starts: list[tuple[datetime, EventMove]] = []
-    move_ids: set[str] = set()
+    movable_events: list[tuple[datetime, datetime, dict[str, Any], ZoneInfo, str]] = []
     timezone_ambiguous: list[dict[str, Any]] = []
     malformed_events: list[dict[str, Any]] = []
     malformed_after_audit: list[dict[str, Any]] = []
@@ -680,32 +716,7 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
         if event_id is None:
             identity_ambiguous.append(event)
             continue
-        proposed_start = (event_start + shift).astimezone(event_timezone)
-        proposed_end = (event_end + shift).astimezone(event_timezone)
-        move_ids.add(event_id)
-        moves_with_starts.append(
-            (
-                event_start,
-                EventMove(
-                event_id=event_id,
-                title=str(event.get("title", "")),
-                original_start_at=_normalized_timestamp(
-                    str(event["start_at"]), event_timezone
-                ),
-                original_end_at=_normalized_timestamp(
-                    str(event["end_at"]), event_timezone
-                ),
-                proposed_start_at=proposed_start.isoformat(),
-                proposed_end_at=proposed_end.isoformat(),
-                duration_seconds=(event_end - event_start).total_seconds(),
-                calendar_id=event.get("calendar_id") if isinstance(event.get("calendar_id"), str) else None,
-                timezone=event_timezone.key,
-                ),
-            )
-        )
-
-    moves_with_starts.sort(key=lambda item: item[0])
-    moves = [move for _, move in moves_with_starts]
+        movable_events.append((event_start, event_end, event, event_timezone, event_id))
 
     if timezone_ambiguous:
         return _clarification(
@@ -741,31 +752,7 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             f"{len(identity_ambiguous)} event(s) that would be moved have a missing or blank ID.",
         )
 
-    conflicts: set[str] = set()
-    for index, move in enumerate(moves):
-        proposed_start = datetime.fromisoformat(move.proposed_start_at.replace("Z", "+00:00"))
-        proposed_end = datetime.fromisoformat(move.proposed_end_at.replace("Z", "+00:00"))
-        for other_move in moves[index + 1:]:
-            other_start = datetime.fromisoformat(other_move.proposed_start_at.replace("Z", "+00:00"))
-            other_end = datetime.fromisoformat(other_move.proposed_end_at.replace("Z", "+00:00"))
-            if _intervals_overlap(proposed_start, proposed_end, other_start, other_end):
-                conflicts.add(f"{move.event_id} with {other_move.event_id}")
-        for event in events:
-            event_id = _event_id(event)
-            if event_id in move_ids or event_id == audit_record_id:
-                continue
-            parsed = _parse_event_interval(event, fallback_timezone)
-            if parsed is not None and _intervals_overlap(proposed_start, proposed_end, *parsed):
-                conflicts.add(f"{move.event_id} with {event_id or 'an unidentified event'}")
-    if conflicts:
-        return _clarification(
-            task,
-            reference,
-            "The rescheduling proposal conflicts with an existing event.",
-            "Conflicting proposed intervals: " + ", ".join(sorted(conflicts)) + ".",
-        )
-
-    if not moves:
+    if not movable_events:
         return _clarification(
             task,
             reference,
@@ -773,23 +760,162 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             "Events overlapping the audit or ending at its boundary are not affected.",
         )
 
+    raw_max_shift_search = task.context.get("max_shift_search")
+    if raw_max_shift_search is None:
+        candidate_shifts = [shift]
+    elif (
+        not shift_was_proposed
+        or not isinstance(raw_max_shift_search, timedelta)
+        or raw_max_shift_search < shift
+        or raw_max_shift_search > _MAX_ALTERNATIVE_SHIFT
+        or (raw_max_shift_search - shift) % _SHIFT_SEARCH_INCREMENT != timedelta(0)
+    ):
+        return _clarification(
+            task,
+            reference,
+            "The alternative shift search bound is invalid.",
+            "Only a proposed shift may use a positive, 30-minute-aligned search bound up to eight hours.",
+        )
+    else:
+        candidate_shifts = [
+            shift + _SHIFT_SEARCH_INCREMENT * step
+            for step in range(
+                int((raw_max_shift_search - shift) / _SHIFT_SEARCH_INCREMENT) + 1
+            )
+        ]
+
+    def build_moves(candidate_shift: timedelta) -> list[EventMove]:
+        proposed: list[tuple[datetime, EventMove]] = []
+        for event_start, event_end, event, event_timezone, event_id in movable_events:
+            proposed_start = (event_start + candidate_shift).astimezone(event_timezone)
+            proposed_end = (event_end + candidate_shift).astimezone(event_timezone)
+            proposed.append(
+                (
+                    event_start,
+                    EventMove(
+                        event_id=event_id,
+                        title=str(event.get("title", "")),
+                        original_start_at=_normalized_timestamp(
+                            str(event["start_at"]), event_timezone
+                        ),
+                        original_end_at=_normalized_timestamp(
+                            str(event["end_at"]), event_timezone
+                        ),
+                        proposed_start_at=proposed_start.isoformat(),
+                        proposed_end_at=proposed_end.isoformat(),
+                        duration_seconds=(event_end - event_start).total_seconds(),
+                        calendar_id=(
+                            event.get("calendar_id")
+                            if isinstance(event.get("calendar_id"), str)
+                            else None
+                        ),
+                        timezone=event_timezone.key,
+                    ),
+                )
+            )
+        proposed.sort(key=lambda item: item[0])
+        return [move for _, move in proposed]
+
+    def find_conflicts(candidate_moves: list[EventMove]) -> set[str]:
+        candidate_move_ids = {move.event_id for move in candidate_moves}
+        found: set[str] = set()
+        for index, move in enumerate(candidate_moves):
+            proposed_start = datetime.fromisoformat(
+                move.proposed_start_at.replace("Z", "+00:00")
+            )
+            proposed_end = datetime.fromisoformat(
+                move.proposed_end_at.replace("Z", "+00:00")
+            )
+            for other_move in candidate_moves[index + 1 :]:
+                other_start = datetime.fromisoformat(
+                    other_move.proposed_start_at.replace("Z", "+00:00")
+                )
+                other_end = datetime.fromisoformat(
+                    other_move.proposed_end_at.replace("Z", "+00:00")
+                )
+                if _intervals_overlap(
+                    proposed_start, proposed_end, other_start, other_end
+                ):
+                    found.add(f"{move.event_id} with {other_move.event_id}")
+            for event in events:
+                event_id = _event_id(event)
+                if event_id in candidate_move_ids or event_id == audit_record_id:
+                    continue
+                parsed = _parse_event_interval(event, fallback_timezone)
+                if parsed is not None and _intervals_overlap(
+                    proposed_start, proposed_end, *parsed
+                ):
+                    found.add(
+                        f"{move.event_id} with {event_id or 'an unidentified event'}"
+                    )
+        return found
+
+    moves: list[EventMove] = []
+    initial_conflicts: set[str] = set()
+    selected_shift: timedelta | None = None
+    for candidate_shift in candidate_shifts:
+        candidate_moves = build_moves(candidate_shift)
+        conflicts = find_conflicts(candidate_moves)
+        if not conflicts:
+            selected_shift = candidate_shift
+            moves = candidate_moves
+            break
+        if not initial_conflicts:
+            initial_conflicts = conflicts
+
+    if selected_shift is None:
+        if len(candidate_shifts) > 1:
+            return _clarification(
+                task,
+                reference,
+                "The 30-minute proposal conflicts, and no conflict-free alternative was found within the eight-hour limit.",
+                f"Checked {len(candidate_shifts)} shifts in 30-minute increments; no event was updated.",
+            )
+        return _clarification(
+            task,
+            reference,
+            "The rescheduling proposal conflicts with an existing event.",
+            "Conflicting proposed intervals: " + ", ".join(sorted(initial_conflicts)) + ".",
+        )
+
+    shift = selected_shift
+
     fallback_note = (
         f" The configured {fallback_timezone.key} timezone fallback is an explicit planning assumption, not a verified platform contract."
         if fallback_timezone is not None
         else ""
     )
-    confirmation_prompt = (
-        "Confirm the proposed 30-minute shift or provide a different positive duration before any update."
-        if shift_was_proposed
-        else "Confirm this plan or provide a different positive shift duration before any update."
-    )
+    requested_shift = _DEFAULT_PROPOSED_SHIFT if shift_was_proposed else shift
+    selected_minutes = int(shift.total_seconds() // 60)
+    if shift_was_proposed and shift != requested_shift:
+        confirmation_prompt = (
+            "The initial 30-minute shift conflicts. The first conflict-free "
+            f"alternative is {selected_minutes} minutes. Confirm this alternative "
+            "or provide a different positive shift before any update."
+        )
+        plan_summary = (
+            "The 30-minute proposal conflicts; a conflict-free "
+            f"{selected_minutes}-minute alternative plan is ready."
+        )
+    elif shift_was_proposed:
+        confirmation_prompt = (
+            "Confirm the proposed 30-minute shift or provide a different "
+            "positive duration before any update."
+        )
+        plan_summary = "A read-only 30-minute rescheduling plan is ready."
+    else:
+        confirmation_prompt = (
+            "Confirm this plan or provide a different positive shift duration "
+            "before any update."
+        )
+        plan_summary = "A read-only rescheduling plan is ready."
     return AgentResult(
         goal=task.goal,
         status=ResultStatus.PLANNED,
         summary=(
-            "A read-only rescheduling plan is ready."
+            plan_summary
             + fallback_note
-            + " Confirm this plan or request a different shift; no events have been moved."
+            + " Confirmation is required; no events have been moved."
         ),
         audit_reference=reference,
         rescheduling_plan=moves,
@@ -797,12 +923,387 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             "moved": False,
             "planned_event_count": len(moves),
             "shift": shift,
+            "requested_shift": requested_shift,
             "shift_was_proposed": shift_was_proposed,
+            "alternative_shift_proposed": shift != requested_shift,
             "confirmation_required": True,
             "confirmation_prompt": confirmation_prompt,
             "timestamp_timezone_fallback": (
                 fallback_timezone.key if fallback_timezone is not None else None
             ),
             "timestamp_timezone_fallback_is_platform_contract": False,
+        },
+    )
+
+
+def _move_signature(result: AgentResult) -> tuple[tuple[str, str, str, str, str], ...]:
+    return tuple(
+        sorted(
+            (
+                move.event_id,
+                move.original_start_at,
+                move.original_end_at,
+                move.proposed_start_at,
+                move.proposed_end_at,
+            )
+            for move in result.rescheduling_plan
+        )
+    )
+
+
+def _execution_failure(
+    result: AgentResult,
+    *,
+    summary: str,
+    completed_updates: int,
+    attempted_updates: int | None = None,
+) -> AgentResult:
+    return AgentResult(
+        goal=result.goal,
+        status=ResultStatus.FAILED,
+        summary=summary,
+        audit_reference=result.audit_reference,
+        rescheduling_plan=list(result.rescheduling_plan),
+        claimed_outcome={
+            "updates_requested": len(result.rescheduling_plan),
+            "updates_attempted": (
+                completed_updates
+                if attempted_updates is None
+                else attempted_updates
+            ),
+            "updates_completed": completed_updates,
+            "verification_passed": False,
+        },
+    )
+
+
+def apply_confirmed_move(
+    task: AgentTask,
+    proposal: AgentResult,
+    tools: CalendarTool,
+    *,
+    confirmation_text: object,
+    allow_disposable_writes: bool,
+) -> AgentResult:
+    """Apply a fresh, conflict-checked plan only after exact human confirmation."""
+
+    if type(allow_disposable_writes) is not bool:
+        raise TypeError("allow_disposable_writes must be a boolean")
+    if proposal.goal != GOAL or proposal.status is not ResultStatus.PLANNED:
+        return _clarification(
+            task,
+            proposal.audit_reference,
+            "There is no eligible move proposal to execute.",
+            "Create a fresh conflict-free proposal before confirming a move.",
+        )
+
+    proposal_outcome = proposal.claimed_outcome
+    proposed_shift = proposal_outcome.get("shift")
+    if (
+        not isinstance(proposed_shift, timedelta)
+        or proposal_outcome.get("confirmation_required") is not True
+    ):
+        return _clarification(
+            task,
+            proposal.audit_reference,
+            "The proposal does not contain a confirmable shift.",
+            "A positive, conflict-free shift proposal is required.",
+        )
+    if not confirms_shift(confirmation_text, proposed_shift):
+        return _clarification(
+            task,
+            proposal.audit_reference,
+            "The confirmation did not explicitly approve the proposed shift.",
+            "Reply with an affirmative statement that repeats the exact proposed duration.",
+        )
+    if not allow_disposable_writes or not getattr(
+        tools, "disposable_mutations_enabled", False
+    ):
+        return _clarification(
+            task,
+            proposal.audit_reference,
+            "Calendar updates are disabled in this execution context.",
+            "No events were changed; updates are permitted only through an explicitly enabled disposable-copy tool.",
+        )
+
+    fresh_context = dict(task.context)
+    fresh_context.pop("confirmation_text", None)
+    fresh_context.pop("max_shift_search", None)
+    fresh_context["shift"] = proposed_shift
+    fresh_task = AgentTask(task.goal, task.instruction, fresh_context)
+    fresh_proposal = plan(fresh_task, tools)
+    if (
+        fresh_proposal.status is not ResultStatus.PLANNED
+        or fresh_proposal.claimed_outcome.get("shift") != proposed_shift
+    ):
+        return _clarification(
+            task,
+            fresh_proposal.audit_reference,
+            "The calendar changed or the confirmed shift is no longer conflict-free.",
+            "Review the updated calendar and confirm a new proposal; no events were changed.",
+        )
+    if _move_signature(fresh_proposal) != _move_signature(proposal):
+        fresh_proposal.summary = (
+            "The calendar state changed after the prior proposal. "
+            "Review and confirm this refreshed plan; no events were changed."
+        )
+        fresh_proposal.claimed_outcome["confirmation_required"] = True
+        fresh_proposal.claimed_outcome["confirmation_prompt"] = (
+            "The plan changed. Confirm the displayed shift again before any update."
+        )
+        return fresh_proposal
+
+    reference = fresh_proposal.audit_reference
+    if reference is None or len(reference.candidates) != 1:
+        return _clarification(
+            task,
+            reference,
+            "The confirmed audit reference is no longer unique.",
+            "No events were changed.",
+        )
+    calendar_id = reference.candidates[0].calendar_id
+    if not isinstance(calendar_id, str) or not calendar_id.strip():
+        return _clarification(
+            task,
+            reference,
+            "The confirmed audit has no verified calendar scope.",
+            "No events were changed.",
+        )
+
+    fallback_name = fresh_proposal.claimed_outcome.get(
+        "timestamp_timezone_fallback"
+    )
+    fallback_timezone = _parse_timezone(fallback_name)
+    try:
+        current_events = _list_complete_events(
+            tools,
+            calendar_id=calendar_id,
+        )
+    except CalendarEventListError as exc:
+        return _clarification(
+            task,
+            reference,
+            "The calendar changed or could not be re-read before updates.",
+            str(exc),
+        )
+
+    events_by_id: dict[str, dict[str, Any]] = {}
+    for event in current_events:
+        event_id = _event_id(event)
+        if event_id is None or event_id in events_by_id:
+            return _clarification(
+                task,
+                reference,
+                "The calendar state is ambiguous before updates.",
+                "Event identities must be present and unique; no events were changed.",
+            )
+        events_by_id[event_id] = event
+
+    audit_ref = reference.candidates[0]
+    audit_matches = [
+        event
+        for event in current_events
+        if event.get("number") == audit_ref.id
+        or _event_id(event) == audit_ref.id
+    ]
+    if len(audit_matches) != 1:
+        return _clarification(
+            task,
+            reference,
+            "The confirmed audit is missing or ambiguous in the current calendar.",
+            "No events were changed.",
+        )
+    current_audit_times = _parse_event_times(
+        audit_matches[0], fallback_timezone
+    )
+    reference_times = (
+        _parse_event_times(
+            {
+                "start_at": audit_ref.start_at,
+                "end_at": audit_ref.end_at,
+                "timezone": audit_ref.timezone,
+            },
+            fallback_timezone,
+        )
+    )
+    if current_audit_times is None or current_audit_times != reference_times:
+        return _clarification(
+            task,
+            reference,
+            "The audit interval changed after the proposal.",
+            "Review and confirm a new proposal; no events were changed.",
+        )
+    audit_end = current_audit_times[1]
+
+    expected_move_ids: set[str] = set()
+    for event in current_events:
+        event_id = _event_id(event)
+        if event_id == _event_id(audit_matches[0]):
+            continue
+        interval = _parse_event_times(event, fallback_timezone)
+        if interval is None:
+            return _clarification(
+                task,
+                reference,
+                "An event could not be revalidated before updates.",
+                "The move was cancelled; no events were changed.",
+            )
+        if interval[0] > audit_end:
+            expected_move_ids.add(event_id or "")
+
+    planned_moves = {move.event_id: move for move in fresh_proposal.rescheduling_plan}
+    if (
+        not expected_move_ids
+        or "" in expected_move_ids
+        or set(planned_moves) != expected_move_ids
+    ):
+        return _clarification(
+            task,
+            reference,
+            "The affected-event set changed after the proposal.",
+            "Review and confirm a new proposal; no events were changed.",
+        )
+    for event_id, move in planned_moves.items():
+        event = events_by_id[event_id]
+        current_times = _parse_event_times(event, fallback_timezone)
+        move_original_times = _parse_event_times(
+            {
+                "start_at": move.original_start_at,
+                "end_at": move.original_end_at,
+                "timezone": move.timezone,
+            },
+            fallback_timezone,
+        )
+        if current_times is None or current_times != move_original_times:
+            return _clarification(
+                task,
+                reference,
+                "A planned event changed after the proposal.",
+                "Review and confirm a new proposal; no events were changed.",
+            )
+
+    attempted_updates = 0
+    completed_updates = 0
+    for move in fresh_proposal.rescheduling_plan:
+        attempted_updates += 1
+        try:
+            response = tools.update_event(
+                id=move.event_id,
+                start_at=move.proposed_start_at,
+                end_at=move.proposed_end_at,
+            )
+        except (CalendarMutationError, MutationDisabledError) as exc:
+            return _execution_failure(
+                fresh_proposal,
+                summary=(
+                    f"Calendar update stopped after {attempted_updates} update "
+                    f"attempt(s); {completed_updates} response(s) were verified "
+                    f"({type(exc).__name__}). The disposable copy may contain "
+                    "partial test changes; reread state before any retry."
+                ),
+                completed_updates=completed_updates,
+                attempted_updates=attempted_updates,
+            )
+        if not isinstance(response, dict) or response.get("id") != move.event_id:
+            return _execution_failure(
+                fresh_proposal,
+                summary=(
+                    f"Calendar update response was not verifiable after "
+                    f"{attempted_updates} update attempt(s); {completed_updates} "
+                    "response(s) were verified. The disposable copy may contain "
+                    "partial test changes; reread state before any retry."
+                ),
+                completed_updates=completed_updates,
+                attempted_updates=attempted_updates,
+            )
+        completed_updates += 1
+
+    try:
+        updated_events = _list_complete_events(tools, calendar_id=calendar_id)
+    except CalendarEventListError as exc:
+        return _execution_failure(
+            fresh_proposal,
+            summary=(
+                f"All {completed_updates} updates were requested, but the final "
+                f"calendar read failed ({type(exc).__name__}); completion is unverified."
+            ),
+            completed_updates=completed_updates,
+            attempted_updates=attempted_updates,
+        )
+
+    updated_by_id = {
+        event_id: event
+        for event in updated_events
+        if (event_id := _event_id(event)) is not None
+    }
+    if (
+        len(updated_by_id) != len(updated_events)
+        or set(updated_by_id) != set(events_by_id)
+    ):
+        return _execution_failure(
+            fresh_proposal,
+            summary=(
+                "Final calendar read contains missing, duplicate, or unexpected "
+                "event IDs."
+            ),
+            completed_updates=completed_updates,
+            attempted_updates=attempted_updates,
+        )
+    planned_event_ids = set(planned_moves)
+    for event_id, event in events_by_id.items():
+        if event_id in planned_event_ids:
+            continue
+        if event != updated_by_id[event_id]:
+            return _execution_failure(
+                fresh_proposal,
+                summary=(
+                    "An event outside the confirmed move set changed during "
+                    f"execution; {attempted_updates} planned update attempt(s) "
+                    "were issued."
+                ),
+                completed_updates=completed_updates,
+                attempted_updates=attempted_updates,
+            )
+    for move in fresh_proposal.rescheduling_plan:
+        event = updated_by_id.get(move.event_id)
+        actual_times = (
+            _parse_event_times(event, fallback_timezone)
+            if event is not None
+            else None
+        )
+        expected_times = _parse_event_times(
+            {
+                "start_at": move.proposed_start_at,
+                "end_at": move.proposed_end_at,
+                "timezone": move.timezone,
+            },
+            fallback_timezone,
+        )
+        if actual_times is None or actual_times != expected_times:
+            return _execution_failure(
+                fresh_proposal,
+                summary=(
+                    f"Post-update verification failed after {completed_updates} "
+                    "event updates; completion is unverified."
+                ),
+                completed_updates=completed_updates,
+                attempted_updates=attempted_updates,
+            )
+
+    return AgentResult(
+        goal=task.goal,
+        status=ResultStatus.COMPLETED,
+        summary=(
+            f"Confirmed shift applied and verified for {completed_updates} "
+            "event(s) in the disposable calendar copy."
+        ),
+        audit_reference=fresh_proposal.audit_reference,
+        rescheduling_plan=list(fresh_proposal.rescheduling_plan),
+        claimed_outcome={
+            "moved": True,
+            "shift": proposed_shift,
+            "confirmation_required": False,
+            "updates_attempted": attempted_updates,
+            "updates_verified": completed_updates,
         },
     )

@@ -327,3 +327,7 @@ class AgentResult:
 
 class MutationDisabledError(RuntimeError):
     """Raised when a goal attempts a mutation before mutation execution is enabled."""
+
+
+class CalendarMutationError(RuntimeError):
+    """Raised when an explicitly confirmed Calendar mutation fails."""

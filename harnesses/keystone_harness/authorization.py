@@ -25,6 +25,12 @@ RESOURCE_READ_OPERATIONS = frozenset(
         "EventAttendee.list",
     }
 )
+DISPOSABLE_CALENDAR_MUTATION_OPERATIONS = frozenset(
+    {
+        "CalendarEvent.create",
+        "CalendarEvent.update",
+    }
+)
 
 _ANNOTATION_KEYWORDS = frozenset(
     {
@@ -97,6 +103,108 @@ def validate_resource_read_policy(
     _validate_safety_metadata(operation, tool)
     _validate_descriptor_schemas(operation, tool)
     _validate_arguments(tool.input_schema, arguments)
+    return tool
+
+
+def validate_disposable_calendar_mutation_policy(
+    discovery: ToolDiscoveryResult,
+    operation: str,
+    arguments: Mapping[str, Any],
+) -> DiscoveredTool:
+    """Validate one explicitly opted-in Calendar create/update for a disposable copy."""
+
+    if not isinstance(discovery, ToolDiscoveryResult):
+        raise TypeError("discovery must be a ToolDiscoveryResult")
+    if (
+        not isinstance(operation, str)
+        or operation not in DISPOSABLE_CALENDAR_MUTATION_OPERATIONS
+    ):
+        raise KeystoneOperationNotAllowedError(
+            "Calendar mutation is not in the exact disposable-copy allowlist."
+        )
+
+    matches = [tool for tool in discovery.tools if tool.name == operation]
+    if len(matches) != 1:
+        raise KeystoneOperationNotAllowedError(
+            f"{operation} must appear exactly once in the observed tool catalog."
+        )
+    tool = matches[0]
+    annotations = tool.annotations
+    if (
+        type(tool.read_only_hint) is not bool
+        or tool.read_only_hint is not False
+        or not isinstance(annotations, Mapping)
+        or annotations.get("readOnlyHint") is not False
+        or annotations.get("destructiveHint") is not False
+    ):
+        raise KeystoneOperationNotAllowedError(
+            f"{operation} lacks the expected non-read-only mutation descriptor."
+        )
+    if (
+        not isinstance(tool.input_schema, Mapping)
+        or tool.input_schema.get("type") != "object"
+        or tool.input_schema.get("additionalProperties") is not False
+    ):
+        raise KeystoneProtocolError(
+            f"{operation} inputSchema must be an object that rejects additional properties."
+        )
+    if not isinstance(tool.output_schema, Mapping):
+        raise KeystoneProtocolError(f"{operation} has no declared outputSchema.")
+    output_properties = tool.output_schema.get("properties")
+    if (
+        tool.output_schema.get("type") != "object"
+        or not isinstance(output_properties, Mapping)
+        or "id" not in tool.output_schema.get("required", [])
+        or not isinstance(output_properties.get("id"), Mapping)
+        or output_properties["id"].get("type") != "string"
+    ):
+        raise KeystoneProtocolError(
+            f"{operation} outputSchema must return a string event ID."
+        )
+
+    if operation == "CalendarEvent.update":
+        allowed_fields = {"id", "start_at", "end_at"}
+        if set(arguments) - allowed_fields:
+            raise KeystoneOperationNotAllowedError(
+                "Disposable CalendarEvent.update may change only event ID and times."
+            )
+        if not {"id", "start_at", "end_at"}.issubset(arguments):
+            raise KeystoneProtocolError(
+                "Disposable CalendarEvent.update requires ID, start_at, and end_at."
+            )
+        start = arguments.get("start_at")
+        end = arguments.get("end_at")
+        if not isinstance(start, str) or not isinstance(end, str):
+            raise KeystoneProtocolError(
+                "Disposable CalendarEvent.update requires string timestamps."
+            )
+        try:
+            parsed_start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            parsed_end = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        except ValueError:
+            raise KeystoneProtocolError(
+                "Disposable CalendarEvent.update timestamps are invalid."
+            ) from None
+        if (
+            parsed_start.tzinfo is None
+            or parsed_start.utcoffset() is None
+            or parsed_end.tzinfo is None
+            or parsed_end.utcoffset() is None
+            or parsed_end <= parsed_start
+        ):
+            raise KeystoneProtocolError(
+                "Disposable CalendarEvent.update timestamps must be aware and ordered."
+            )
+    elif set(arguments) - {"calendar_id", "title", "start_at", "end_at", "timezone"}:
+        raise KeystoneOperationNotAllowedError(
+            "Disposable CalendarEvent.create accepts only a simple timed test event."
+        )
+
+    validate_json_schema_instance(
+        tool.input_schema,
+        dict(arguments),
+        location="disposable Calendar mutation arguments",
+    )
     return tool
 
 

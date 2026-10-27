@@ -57,7 +57,15 @@ The handlers remain read-only and stop before event execution:
   explicit calendar scope and positive shift are supplied, and every `CalendarEvent.list` page is validated as complete;
   it does not move any events.
 
-Goal 1 never creates or books the candidate event, and Goal 2 never updates events. `PLANNED` means only that the read-only state supports a candidate slot or rescheduling plan; it is not equivalent to booking or moving events. The official evaluator predicates/scorer and final mutation semantics remain unavailable and unknown.
+Goal 1 never creates or books the candidate event. Goal 2 is read-only by
+default: `PLANNED` means a proposal is ready, not that events moved. A separate
+follow-up can execute a fresh move plan only after the user's reply explicitly
+confirms the exact proposed shift and the caller opts into disposable-copy
+mutations. The normal hosted result checks remain read-only. Keystone mutation
+transport additionally requires an exact, explicitly approved HTTPS disposable
+base URL; IP targets and the shared AgentSwitch live domain and its subdomains
+are rejected. Official
+evaluator predicates/scorer and final mutation semantics remain unavailable.
 
 ## Harness demonstration
 
@@ -88,11 +96,16 @@ client appends `/api/mcp`, so that endpoint itself must not be supplied. Query
 strings and fragments are rejected.
 
 The hosted runner includes separate read-only tasks for
-`calendar.find_30_minutes` and `calendar.move_after_audit`. For Suryodaya, Goal 1 candidates remain
-`UNEVALUATED` because no authoritative Goal 1 predicate is available. Goal 2
-resolves `EVT-2026-00007` by its supported event-number filter, checks
-its title, confirmed status, and event-associated calendar, and requires a
-complete event listing before planning. Explicit offsets remain instants.
+`calendar.find_30_minutes` and `calendar.move_after_audit`, each with an
+explicit harness-owned predicate. Goal 1 passes only when the planner returns
+one structurally valid 30-minute candidate and a fresh harness read confirms
+the participant, owned calendar, preferences, linked availability rule, and
+free/busy state. Clarifications are reported with allowlisted reason codes,
+not raw participant or calendar details. It never books the candidate. For
+Suryodaya, Goal 2 resolves
+`EVT-2026-00007` by its supported event-number filter, checks its title,
+confirmed status, and event-associated calendar, and requires a complete
+event listing before planning. Explicit offsets remain instants.
 When a timestamp has no event timezone, the instructor-confirmed rule is to
 use the owning calendar's timezone, then the company's timezone. The current
 tool interface can read the owning calendar timezone but does not expose a
@@ -101,10 +114,27 @@ returned until the server applies the documented fallback. Ambiguous and
 nonexistent local times fail closed. Offset-versus-IANA precedence remains
 unverified. The
 30-minute proposal is presented for confirmation or change; events are never
-updated. A Goal 2 result is non-passing when clarification or incomplete
-evidence prevents a plan. A `passed` Goal 2 result represents
-the local read-only plan check against the instructor's stated criteria, not
-an invocation of the official evaluator.
+updated. The harness-owned Goal 2 predicate passes only for a unique confirmed
+audit, a complete conflict-free plan, and a non-empty confirmation request.
+The planner first proposes 30 minutes; if that conflicts, the hosted check may
+search 30-minute increments up to eight hours and present the first
+conflict-free alternative. Every proposal still requires confirmation, and no
+event is moved by this check. Ambiguous audits, conflicts throughout the
+bounded search, or incomplete evidence remain non-passing.
+Before each hosted predicate scores an executed task, the runner persists a
+redacted execution journal under
+`.harness-artifacts/runs/<run_id>/<instance>/`. The journal omits tool
+arguments, records structured result facts and tool-call metadata, then stores
+the independent check result. `results.json` remains the platform-facing
+summary.
+The normal hosted result runner never applies a proposal. A separate
+`CalendarAgent.confirm_move` follow-up requires an affirmative message that
+repeats the proposed duration, a fresh conflict check, and explicit
+disposable-write opt-ins on both the agent and tool adapter. Keystone also
+requires its hosted mutation transport to be explicitly enabled and the
+`CalendarEvent.update` descriptor to be discovered, with the exact disposable
+base URL explicitly approved by the caller. These write capabilities are not
+enabled by the standard `agentswitch-harness.toml` command.
 
 For Keystone, the hosted-only client requires an observed, schema-validated
 `tools/list` descriptor for each read tool before making one-shot `tools/call` requests for
@@ -112,11 +142,14 @@ For Keystone, the hosted-only client requires an observed, schema-validated
 Only `structuredContent` matching the discovered output schema is used;
 text-only results fail closed. Goal 1 remains non-passing because Keystone
 does not expose the required preference, availability-rule, or free/busy
-capabilities, and no authoritative Goal 1 predicate is available. Goal 2
-requires exactly one audit search result and its owning calendar before
-producing a 30-minute plan for confirmation. These are local harness checks,
-not official evaluator results. `results.json` reports the checks and the
-runner summary explicitly says `official_evaluator=not_invoked`.
+capabilities, so its Goal 1 check remains non-passing. Goal 2 requires exactly
+one audit search result and its owning calendar before producing a 30-minute
+plan for confirmation. These are harness-owned checks, not official evaluator
+results. `results.json` reports the checks and the runner summary explicitly
+says `official_evaluator=not_invoked`.
+The hosted command exits successfully after writing a valid result document,
+even when individual checks fail; task outcomes are reported in each result
+record. A nonzero exit is reserved for runner or result-generation errors.
 
 The earlier live Suryodaya snapshot could not produce a Goal 2 plan under the
 then-strict timestamp parser because event timestamps lacked offsets and most
