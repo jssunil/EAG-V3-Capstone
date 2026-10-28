@@ -539,6 +539,14 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
                 )
             )
         ]
+        selected_event_id = task.context.get("audit_event_id")
+        if isinstance(selected_event_id, str) and selected_event_id.strip():
+            # A caller that already chose one of several same-titled audits pins it by ID.
+            audit_like = [
+                event
+                for event in audit_like
+                if _event_id(event) == selected_event_id.strip()
+            ]
         if (
             fallback_timezone is None
             and use_calendar_timezone
