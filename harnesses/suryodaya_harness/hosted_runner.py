@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -244,6 +245,16 @@ def load_hosted_environment(values: Mapping[str, object]) -> HostedEnvironment:
         base_url=base_url.rstrip("/"),
         token=token_value.strip(),
     )
+
+
+def _with_plan(prefix: str, move_summary: str, suffix: str = "") -> str:
+    """Embed the full plan when it fits the evidence limit, else a fingerprint of it."""
+
+    full = f"{prefix}plan={move_summary}{suffix}"
+    if len(full) <= MAX_EVIDENCE_LENGTH:
+        return full
+    digest = hashlib.sha256(move_summary.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}plan_sha={digest}{suffix}"
 
 
 def _read_trace_summary(calls: list[ToolCallRecord]) -> str:
@@ -492,7 +503,7 @@ def check_suryodaya_goal_two(
         f"{move.event_id}:{move.proposed_start_at}>{move.proposed_end_at}"
         for move in result.rescheduling_plan
     )
-    evidence = (
+    evidence = _with_plan(
         "HARNESS_PREDICATE: "
         f"audit={GOAL_TWO_AUDIT_NUMBER};calendar="
         f"{reference.candidates[0].calendar_id if exact_reference else 'unverified'};"
@@ -501,8 +512,8 @@ def check_suryodaya_goal_two(
         f"confirmation_required={str(confirmation_required).lower()};"
         "confirm_or_change_shift=true;"
         "events_moved=false;"
-        f"mutation_attempts={sum(call.mutating for call in result.tool_calls)};"
-        f"plan={move_summary}"
+        f"mutation_attempts={sum(call.mutating for call in result.tool_calls)};",
+        move_summary,
     )
     passed = (
         verification.passed
@@ -768,15 +779,16 @@ def check_keystone_goal_two(
         f"{move.event_id}:{move.proposed_start_at}>{move.proposed_end_at}"
         for move in result.rescheduling_plan
     )
-    evidence = (
+    evidence = _with_plan(
         "HARNESS_PREDICATE: "
         f"calendar_resolved={str(exact_calendar).lower()};"
         f"moves={len(result.rescheduling_plan)};"
         f"requested_shift=30m;proposed_shift={proposed_shift_minutes}m;"
         f"confirmation_required={str(confirmation_required).lower()};"
         "events_moved=false;"
-        f"mutation_attempts={sum(call.mutating for call in trace)};"
-        f"plan={move_summary};{trace_summary}"
+        f"mutation_attempts={sum(call.mutating for call in trace)};",
+        move_summary,
+        f";{trace_summary}",
     )
     passed = (
         verification.passed
